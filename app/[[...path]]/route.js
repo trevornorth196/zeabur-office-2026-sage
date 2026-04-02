@@ -71,11 +71,11 @@ async function handleProxy(request, pathSegments = []) {
   const method = request.method;
   const request_headers = request.headers;
   
-  // Build headers - copy all but let fetch set Host automatically
+  // Build headers - copy all and SET Host header (don't delete it)
   const new_request_headers = new Headers(request_headers);
   
-  // Remove original Host header to let fetch set it correctly based on URL
-  new_request_headers.delete('Host');
+  // FIX: Set Host header explicitly (required by Microsoft)
+  new_request_headers.set('Host', upstream_domain);
   
   // Set Referer to the upstream domain
   new_request_headers.set('Referer', `https://${upstream_domain}`);
