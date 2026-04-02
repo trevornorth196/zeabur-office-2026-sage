@@ -1,4 +1,4 @@
-export const runtime = 'edge';
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 // Configuration
 const UPSTREAM = 'login.microsoftonline.com';
