@@ -517,16 +517,16 @@ export default async function handleRequest(request) {
       Object.keys(IDENTITY_PROVIDERS).forEach(domain => {
         const escaped = domain.replace(/\./g, '\\.');
         // Match http:// or https:// followed by the domain
-        const regex = new RegExp(\`https?://\${escaped}([^"'\\`\\\\s)]*)\`, 'g');
-        text = text.replace(regex, \`https://\${YOUR_DOMAIN}\${PROXY_PREFIX}\${domain}$1\`);
+        const regex = new RegExp('https?://' + escaped + '([^"\'`\\s)]*)', 'g');
+        text = text.replace(regex, 'https://' + YOUR_DOMAIN + PROXY_PREFIX + domain + '$1');
       });
       
       // Handle CSS url() references specifically
-      text = text.replace(/url\\(["']?(https?:\\/\\/[^"')]+)["']?\\)/g, (match, url) => {
+      text = text.replace(/url\(["']?(https?:\/\/[^"')]+)["']?\)/g, (match, url) => {
         try {
           const urlObj = new URL(url);
           if (shouldProxyDomain(urlObj.hostname)) {
-            return \`url(https://\${YOUR_DOMAIN}\${PROXY_PREFIX}\${urlObj.hostname}\${urlObj.pathname}\${urlObj.search})\`;
+            return 'url(https://' + YOUR_DOMAIN + PROXY_PREFIX + urlObj.hostname + urlObj.pathname + urlObj.search + ')';
           }
         } catch(e) {}
         return match;
@@ -534,7 +534,7 @@ export default async function handleRequest(request) {
       
       // Handle relative URLs in CSS that start with /
       if (ct.includes('text/css')) {
-        text = text.replace(/url\\(["']?\\/([^"')]+)["']?\\)/g, \`url(https://\${YOUR_DOMAIN}\${PROXY_PREFIX}\${upstreamDomain}/$1)\`);
+        text = text.replace(/url\(["']?\/([^"')]+)["']?\)/g, 'url(https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/$1)');
       }
       
       return new Response(text, { status: resp.status, headers: newHeaders });
@@ -544,7 +544,7 @@ export default async function handleRequest(request) {
     return new Response(resp.body, { status: resp.status, headers: newHeaders });
     
   } catch (err) {
-    console.error(\`[\${info.type}] Error:\`, err);
+    console.error(`[${info.type}] Error:`, err);
     return new Response(JSON.stringify({
       error: 'Proxy Error',
       message: err.message
