@@ -863,11 +863,11 @@ export default async function handleRequest(request) {
           const urls = srcset.split(',').map(part => {
             const [url, descriptor] = part.trim().split(/\s+/);
             if (url && url.startsWith('/') && !url.startsWith('/_p/')) {
-              return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}${url}${descriptor ? ' ' + descriptor : ''}`;
+              return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + url + (descriptor ? ' ' + descriptor : '');
             }
             return part;
           });
-          return `srcset="${urls.join(', ')}"`;
+          return 'srcset="' + urls.join(', ') + '"';
         });
       }
 
@@ -876,31 +876,31 @@ export default async function handleRequest(request) {
           if (path.startsWith('_p/') || path.startsWith('data:') || path.startsWith('blob:')) {
             return match;
           }
-          return `${attr}="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/${path}"`;
+          return attr + '="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/' + path + '"';
         });
 
         text = text.replace(/(src|href)='\/([^']+)'/gi, (match, attr, path) => {
           if (path.startsWith('_p/') || path.startsWith('data:') || path.startsWith('blob:')) {
             return match;
           }
-          return `${attr}='https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/${path}'`;
+          return attr + '="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/' + path + '"';
         });
 
         text = text.replace(/src="\/_next\/static\/([^"]+)"/gi, 
-          `src="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/_next/static/$1"`);
+          'src="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/_next/static/$1"');
         text = text.replace(/href="\/_next\/static\/([^"]+)"/gi, 
-          `href="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/_next/static/$1"`);
+          'href="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/_next/static/$1"');
         text = text.replace(/src='\/_next\/static\/([^']+)'/gi, 
-          `src='https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/_next/static/$1'`);
+          'src="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/_next/static/$1"');
         text = text.replace(/href='\/_next\/static\/([^']+)'/gi, 
-          `href='https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/_next/static/$1'`);
+          'href="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/_next/static/$1"');
 
         const currentDir = info.path.replace(/\/[^\/]*$/, '/');
         text = text.replace(/(src|href)="([^"]+)"/gi, (match, attr, path) => {
           if (path.startsWith('/') || path.startsWith('http') || path.startsWith('data:') || path.startsWith('blob:') || path.startsWith('#')) {
             return match;
           }
-          return `${attr}="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}${currentDir}${path}"`;
+          return attr + '="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + currentDir + path + '"';
         });
       }
 
