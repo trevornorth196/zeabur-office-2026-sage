@@ -883,17 +883,17 @@ export default async function handleRequest(request) {
           if (path.startsWith('_p/') || path.startsWith('data:') || path.startsWith('blob:')) {
             return match;
           }
-          return `${attr}='https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/${path}'`;
+          return attr + '="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/' + path + '"';
         });
 
         text = text.replace(/src="\/_next\/static\/([^"]+)"/gi, 
-          'src="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/_next/static/$1"');
+          `src="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/_next/static/$1"`);
         text = text.replace(/href="\/_next\/static\/([^"]+)"/gi, 
-          'href="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/_next/static/$1"');
+          `href="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/_next/static/$1"`);
         text = text.replace(/src='\/_next\/static\/([^']+)'/gi, 
-          'src="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/_next/static/$1"');
+          `src='https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/_next/static/$1'`);
         text = text.replace(/href='\/_next\/static\/([^']+)'/gi, 
-          'href="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/_next/static/$1"');
+          `href='https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/_next/static/$1'`);
 
         const currentDir = info.path.replace(/\/[^\/]*$/, '/');
         text = text.replace(/(src|href)="([^"]+)"/gi, (match, attr, path) => {
@@ -937,9 +937,9 @@ export default async function handleRequest(request) {
         });
 
         text = text.replace(/action="\/([^"]*)"/gi, 
-          'action="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/$1"');
+          `action="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$1"`);
         text = text.replace(/action='\/([^']*)'/gi, 
-          'action="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/$1"');
+          `action='https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$1'`);
       }
 
       return new Response(text, { status: resp.status, headers: newHeaders });
