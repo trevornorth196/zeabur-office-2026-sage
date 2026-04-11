@@ -194,7 +194,7 @@ function rewriteLocation(location) {
   try {
     const url = new URL(location);
     if (shouldProxyDomain(url.hostname)) {
-      return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${url.hostname}${url.pathname}${url.search}`;
+      return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + url.hostname + url.pathname + url.search;
     }
     return location;
   } catch (e) {
@@ -815,7 +815,7 @@ export default async function handleRequest(request) {
         // CRITICAL FIX: Rewrite cookie paths to match proxy URL structure
         if (mod.includes('Path=')) {
           mod = mod.replace(/Path=([^;]+)/i, (match, path) => {
-            return `Path=${PROXY_PREFIX}${upstreamDomain}${path}`;
+            return 'Path=' + PROXY_PREFIX + upstreamDomain + path;
           });
         } else {
           mod += `; Path=${PROXY_PREFIX}${upstreamDomain}/`;
@@ -839,9 +839,9 @@ export default async function handleRequest(request) {
         const interceptor = generateInterceptorScript(upstreamDomain, info.path);
 
         if (text.includes('<head>')) {
-          text = text.replace('<head>', `<head>${interceptor}`);
+          text = text.replace('<head>', '<head>' + interceptor);
         } else if (text.includes('<html>')) {
-          text = text.replace('<html>', `<html>${interceptor}`);
+          text = text.replace('<html>', '<html>' + interceptor);
         } else {
           text = interceptor + text;
         }
@@ -883,7 +883,7 @@ export default async function handleRequest(request) {
           if (path.startsWith('_p/') || path.startsWith('data:') || path.startsWith('blob:')) {
             return match;
           }
-          return attr + '="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/' + path + '"';
+          return `${attr}='https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/${path}'`;
         });
 
         text = text.replace(/src="\/_next\/static\/([^"]+)"/gi, 
@@ -937,9 +937,9 @@ export default async function handleRequest(request) {
         });
 
         text = text.replace(/action="\/([^"]*)"/gi, 
-          `action="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$1"`);
+          'action="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/$1"');
         text = text.replace(/action='\/([^']*)'/gi, 
-          `action='https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$1'`);
+          'action="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/$1"');
       }
 
       return new Response(text, { status: resp.status, headers: newHeaders });
