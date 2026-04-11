@@ -558,20 +558,50 @@ export default async function handleRequest(request) {
     });
   }
 
-  const headers = new Headers(request.headers);
+  // CRITICAL FIX: Build headers carefully to avoid detection
+  const headers = new Headers();
+  
+  // Copy important headers from original request
+  const originalUA = request.headers.get('user-agent');
+  const originalAccept = request.headers.get('accept');
+  const originalAcceptLang = request.headers.get('accept-language');
+  const originalAcceptEnc = request.headers.get('accept-encoding');
+  const originalCookie = request.headers.get('cookie');
+  const originalContentType = request.headers.get('content-type');
+  
+  // Set required headers - use original UA if available, else generic Chrome
+  headers.set('User-Agent', originalUA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+  headers.set('Accept', originalAccept || 'application/json, text/plain, */*');
+  headers.set('Accept-Language', originalAcceptLang || 'en-US,en;q=0.9');
+  headers.set('Accept-Encoding', originalAcceptEnc || 'gzip, deflate, br');
   headers.set('Host', upstreamDomain);
   headers.set('Referer', `https://${upstreamDomain}/`);
   headers.set('Origin', `https://${upstreamDomain}`);
+  
+  // Only set Content-Type if present in original
+  if (originalContentType) {
+    headers.set('Content-Type', originalContentType);
+  }
+  
+  // Copy cookies if present (important for session continuity)
+  if (originalCookie) {
+    headers.set('Cookie', originalCookie);
+  }
+  
+  // Copy X-Requested-With if present (indicates AJAX)
+  const xrw = request.headers.get('x-requested-with');
+  if (xrw) headers.set('X-Requested-With', xrw);
 
-  // CRITICAL FIX: Remove hop-by-hop headers that cause connection issues
-  headers.delete('expect'); // Prevents 100-continue handshake issues
+  // Remove problematic headers that cause issues
+  headers.delete('expect');
   headers.delete('connection');
   headers.delete('keep-alive');
   headers.delete('proxy-connection');
   headers.delete('transfer-encoding');
   headers.delete('x-forwarded-host');
   headers.delete('x-forwarded-proto');
-  headers.delete('content-length'); // Will recalculate exactly
+  headers.delete('x-forwarded-for');
+  headers.delete('content-length'); // Will calculate exactly
 
   let bodyText = null;
   let requestBodyForUpstream = null;
@@ -626,7 +656,6 @@ export default async function handleRequest(request) {
 
     if (!['GET', 'HEAD'].includes(request.method)) {
       if (requestBodyForUpstream !== null) {
-        // CRITICAL: Encode to bytes and set exact Content-Length
         const encoder = new TextEncoder();
         const bodyBytes = encoder.encode(requestBodyForUpstream);
         headers.set('content-length', bodyBytes.length.toString());
