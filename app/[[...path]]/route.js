@@ -863,7 +863,8 @@ export default async function handleRequest(request) {
           const urls = srcset.split(',').map(part => {
             const [url, descriptor] = part.trim().split(/\s+/);
             if (url && url.startsWith('/') && !url.startsWith('/_p/')) {
-              return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}${url}${descriptor ? ' ' + descriptor : ''}`;
+              const desc = descriptor ? ' ' + descriptor : '';
+              return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}${url}` + desc;
             }
             return part;
           });
