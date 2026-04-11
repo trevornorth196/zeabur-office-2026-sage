@@ -713,6 +713,20 @@ export default async function handleRequest(request) {
         let mod = c.replace(/Domain=[^;]+;?/gi, '');
         mod = mod.replace(/Secure;?/gi, '');
         mod = mod.replace(/SameSite=[^;]+;?/gi, '');
+        
+        // CRITICAL FIX: Rewrite cookie paths to match proxy URL structure
+        // Microsoft sets paths like /common, /login, /etc which need to be
+        // rewritten to /_p/login.microsoftonline.com/common etc.
+        if (mod.includes('Path=')) {
+          mod = mod.replace(/Path=([^;]+)/i, (match, path) => {
+            // path includes leading slash (e.g., "/" or "/common")
+            return `Path=${PROXY_PREFIX}${upstreamDomain}${path}`;
+          });
+        } else {
+          // If no Path attribute, add default path scoped to this upstream
+          mod += `; Path=${PROXY_PREFIX}${upstreamDomain}/`;
+        }
+        
         mod += '; SameSite=None; Secure';
         newHeaders.append('Set-Cookie', mod);
       });
